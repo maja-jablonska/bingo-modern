@@ -1,0 +1,53 @@
+{
+  "features": [
+    "LOGG",
+    "TEFF",
+    "MG_FE",
+    "FE_H",
+    "C_FE",
+    "N_FE",
+    "C_N"
+  ],
+  "stats": {
+    "LOGG": {
+      "mean": 2.66939720269796,
+      "std": 0.33056151062783545
+    },
+    "TEFF": {
+      "mean": 4719.782278711108,
+      "std": 188.11113636971373
+    },
+    "MG_FE": {
+      "mean": 0.09562055899724264,
+      "std": 0.09312586432631617
+    },
+    "FE_H": {
+      "mean": -0.09045643308403441,
+      "std": 0.24010224026386467
+    },
+    "C_FE": {
+      "mean": -0.022358100022349267,
+      "std": 0.08328076493594506
+    },
+    "N_FE": {
+      "mean": 0.23358165773984496,
+      "std": 0.10320497404910589
+    },
+    "C_N": {
+      "mean": -0.25593975776219424,
+      "std": 0.16143384496473534
+    }
+  },
+  "train_report": {
+    "dropped_nan": 0,
+    "capped_unphysical_age": 63,
+    "cap_age_gyr": 14.0,
+    "dropped_bad_errors": 0
+  },
+  "test_report": {
+    "dropped_nan": 0,
+    "capped_unphysical_age": 15,
+    "cap_age_gyr": 14.0,
+    "dropped_bad_errors": 0
+  }
+}
