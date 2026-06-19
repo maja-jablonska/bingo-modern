@@ -195,8 +195,14 @@ class BayesianNeuralNetwork(PyroModule):
         log_var_mean = np.log(self.y_std**2 * 0.1)
         self.fc3_var.bias = self._normal_prior(log_var_mean, 0.5, [1], 1)
 
-    def forward(self, x, x_err=None, y=None, y_err=None):
+    def forward(self, x, x_err=None, y=None, y_err=None, w=None):
         """Forward pass with proper input uncertainty modeling
+
+        ``w`` is an optional per-star likelihood weight (shape ``(batch,)``). It
+        is used to (a) rebalance the age distribution via inverse-frequency
+        weights and (b) optionally apply the minibatch-correct ELBO scaling
+        (multiply by ``N_total / batch_size``) so the data term is not
+        over-regularized by the once-per-step KL. ``w=None`` => unweighted.
 
         We model the true (noise-free) inputs as latent variables:
         x_true ~ Normal(x_observed, x_err)
@@ -280,7 +286,14 @@ class BayesianNeuralNetwork(PyroModule):
             total_std = torch.clamp(total_std, min=1e-6)
 
             with pyro.plate("data", y.shape[0]):
-                pyro.sample("obs", dist.Normal(mu, total_std), obs=y)
+                if w is not None:
+                    # Per-star likelihood weighting (inverse-frequency rebalance
+                    # and/or minibatch ELBO correction). Scales each star's
+                    # log-likelihood without touching the global-weight KL term.
+                    with pyro.poutine.scale(scale=w):
+                        pyro.sample("obs", dist.Normal(mu, total_std), obs=y)
+                else:
+                    pyro.sample("obs", dist.Normal(mu, total_std), obs=y)
 
         return mu, model_var, intrinsic_var
 
@@ -539,13 +552,19 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
                     initial_lr: float = 0.005,  # Reduced from 0.01
                     batch_size: int = 512,
                     warmup_epochs: int = 20,  # Learning rate warmup
-                    seed: int = None) -> Tuple[AutoDiagonalNormal, list]:
+                    seed: int = None,
+                    w_train: Optional[torch.Tensor] = None) -> Tuple[AutoDiagonalNormal, list]:
     """Train BNN with smooth loss curves - fixes loss jumps
 
     Key improvements:
     1. Learning rate warmup for first N epochs
     2. Reduced initial learning rate
     3. Better learning rate scheduling
+
+    ``w_train`` is an optional per-star likelihood weight (shape ``(N,)``).
+    When provided it is fed to the model's weighted likelihood so sparse age
+    bins are not drowned out by the bulk of the distribution. ``None`` keeps the
+    original unweighted behaviour.
     """
 
     print("\n" + "="*60)
@@ -562,8 +581,11 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     pyro.clear_param_store()
     print("Parameter store cleared for clean training start")
 
-    # Create data loader for mini-batches
-    dataset = torch.utils.data.TensorDataset(X_train, X_err_train, y_train, y_err_train)
+    # Create data loader for mini-batches (carry per-star weights so the loss
+    # can rebalance the age distribution; default to ones = unweighted).
+    if w_train is None:
+        w_train = torch.ones_like(y_train)
+    dataset = torch.utils.data.TensorDataset(X_train, X_err_train, y_train, y_err_train, w_train)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Setup SVI with improved optimizer settings
@@ -606,8 +628,8 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
         epoch_loss = 0.0
         batch_losses = []
 
-        for batch_x, batch_x_err, batch_y, batch_y_err in loader:
-            loss = svi.step(batch_x, batch_x_err, batch_y, batch_y_err)
+        for batch_x, batch_x_err, batch_y, batch_y_err, batch_w in loader:
+            loss = svi.step(batch_x, batch_x_err, batch_y, batch_y_err, batch_w)
             epoch_loss += loss
             batch_losses.append(loss)
 
