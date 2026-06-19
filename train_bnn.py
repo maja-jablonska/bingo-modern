@@ -117,6 +117,11 @@ class BayesianNeuralNetwork(PyroModule):
         self.y_mean = y_mean
         self.y_std = y_std
 
+        # Device anchor buffer: moves with .to(device) so priors/samples can be
+        # built on the correct device lazily (PyroSample weights are NOT moved
+        # by .to(device) because they are sample sites, not nn.Parameters).
+        self.register_buffer("_prior_anchor", torch.zeros(()))
+
         # Neural network layers for mean prediction
         self.fc1_mean = PyroModule[nn.Linear](input_dim, hidden_dim)
         self.fc2_mean = PyroModule[nn.Linear](hidden_dim, hidden_dim)
@@ -137,78 +142,58 @@ class BayesianNeuralNetwork(PyroModule):
         # Set priors
         self._set_priors()
 
+    def _normal_prior(self, loc, scale, shape, event_dim):
+        """Build a device-aware Normal PyroSample prior.
+
+        The distribution is constructed lazily (at sample time) on the device of
+        ``self._prior_anchor``, which tracks the module device after ``.to()``.
+        This ensures sampled weights land on the same device as the input.
+        """
+        def prior(_module):
+            anchor = self._prior_anchor
+            loc_t = torch.as_tensor(loc, dtype=anchor.dtype, device=anchor.device)
+            scale_t = torch.as_tensor(scale, dtype=anchor.dtype, device=anchor.device)
+            return dist.Normal(loc_t, scale_t).expand(shape).to_event(event_dim)
+        return PyroSample(prior)
+
     def _set_priors(self):
         """Set Bayesian priors"""
         # Use larger prior scale like old model
         prior_scale = 1.0  # Changed from 0.5
 
         # Mean network priors - hidden layers
-        self.fc1_mean.weight = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim, self.input_dim]).to_event(2)
-        )
-        self.fc1_mean.bias = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim]).to_event(1)
-        )
-        self.fc2_mean.weight = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim, self.hidden_dim]).to_event(2)
-        )
-        self.fc2_mean.bias = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim]).to_event(1)
-        )
-        self.fc3_mean.weight = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim, self.hidden_dim]).to_event(2)
-        )
-        self.fc3_mean.bias = PyroSample(
-            dist.Normal(0., prior_scale).expand([self.hidden_dim]).to_event(1)
-        )
+        self.fc1_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.input_dim], 2)
+        self.fc1_mean.bias = self._normal_prior(0., prior_scale, [self.hidden_dim], 1)
+        self.fc2_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.hidden_dim], 2)
+        self.fc2_mean.bias = self._normal_prior(0., prior_scale, [self.hidden_dim], 1)
+        self.fc3_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.hidden_dim], 2)
+        self.fc3_mean.bias = self._normal_prior(0., prior_scale, [self.hidden_dim], 1)
 
         # Skip connection priors (if used)
         if self.use_skip_connections:
-            self.fc_skip_mean.weight = PyroSample(
-                dist.Normal(0., prior_scale).expand([self.hidden_dim, self.input_dim]).to_event(2)
-            )
-            self.fc_skip_mean.bias = PyroSample(
-                dist.Normal(0., prior_scale).expand([self.hidden_dim]).to_event(1)
-            )
+            self.fc_skip_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.input_dim], 2)
+            self.fc_skip_mean.bias = self._normal_prior(0., prior_scale, [self.hidden_dim], 1)
 
         # Output layer priors
         output_weight_scale = prior_scale / self.hidden_dim**0.5
-        self.fc_out_mean.weight = PyroSample(
-            dist.Normal(0., output_weight_scale).expand([1, self.hidden_dim]).to_event(2)
-        )
+        self.fc_out_mean.weight = self._normal_prior(0., output_weight_scale, [1, self.hidden_dim], 2)
 
         # CRITICAL FIX: Use standard or empirical Bayes based on flag
         if self.use_empirical_output_bias:
-            self.fc_out_mean.bias = PyroSample(
-                dist.Normal(self.y_mean, self.y_std * 1.0).expand([1]).to_event(1)
-            )
+            self.fc_out_mean.bias = self._normal_prior(self.y_mean, self.y_std * 1.0, [1], 1)
         else:
             # Standard prior like old model - better for extrapolation
-            self.fc_out_mean.bias = PyroSample(
-                dist.Normal(0., prior_scale).expand([1]).to_event(1)
-            )
+            self.fc_out_mean.bias = self._normal_prior(0., prior_scale, [1], 1)
 
         # Variance network priors
         var_prior_scale = prior_scale * 0.3  # Adjusted
-        self.fc1_var.weight = PyroSample(
-            dist.Normal(0., var_prior_scale).expand([self.hidden_dim//2, self.input_dim]).to_event(2)
-        )
-        self.fc1_var.bias = PyroSample(
-            dist.Normal(0., var_prior_scale).expand([self.hidden_dim//2]).to_event(1)
-        )
-        self.fc2_var.weight = PyroSample(
-            dist.Normal(0., var_prior_scale).expand([self.hidden_dim//4, self.hidden_dim//2]).to_event(2)
-        )
-        self.fc2_var.bias = PyroSample(
-            dist.Normal(0., var_prior_scale).expand([self.hidden_dim//4]).to_event(1)
-        )
-        self.fc3_var.weight = PyroSample(
-            dist.Normal(0., var_prior_scale).expand([1, self.hidden_dim//4]).to_event(2)
-        )
+        self.fc1_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2, self.input_dim], 2)
+        self.fc1_var.bias = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2], 1)
+        self.fc2_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//4, self.hidden_dim//2], 2)
+        self.fc2_var.bias = self._normal_prior(0., var_prior_scale, [self.hidden_dim//4], 1)
+        self.fc3_var.weight = self._normal_prior(0., var_prior_scale, [1, self.hidden_dim//4], 2)
         log_var_mean = np.log(self.y_std**2 * 0.1)
-        self.fc3_var.bias = PyroSample(
-            dist.Normal(log_var_mean, 0.5).expand([1]).to_event(1)
-        )
+        self.fc3_var.bias = self._normal_prior(log_var_mean, 0.5, [1], 1)
 
     def forward(self, x, x_err=None, y=None, y_err=None):
         """Forward pass with proper input uncertainty modeling
@@ -269,9 +254,15 @@ class BayesianNeuralNetwork(PyroModule):
         log_model_var = torch.clamp(log_model_var, min=-10, max=3)  # Reduced max
         model_var = torch.exp(log_model_var)
 
-        # Intrinsic scatter
-        log_intrinsic_std = pyro.sample("log_intrinsic_std",
-                                       dist.Normal(np.log(0.1), 0.3))  # Tighter prior
+        # Intrinsic scatter (device-aware prior so the sample matches input device)
+        anchor = self._prior_anchor
+        log_intrinsic_std = pyro.sample(
+            "log_intrinsic_std",
+            dist.Normal(
+                torch.as_tensor(np.log(0.1), dtype=anchor.dtype, device=anchor.device),
+                torch.as_tensor(0.3, dtype=anchor.dtype, device=anchor.device),
+            ),
+        )  # Tighter prior
         intrinsic_var = torch.exp(log_intrinsic_std) ** 2
 
         # Register outputs
