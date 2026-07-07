@@ -551,15 +551,12 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
                     num_iterations: int = 8000,
                     initial_lr: float = 0.005,  # Reduced from 0.01
                     batch_size: int = 512,
-                    warmup_epochs: int = 20,  # Learning rate warmup
                     seed: int = None,
                     w_train: Optional[torch.Tensor] = None) -> Tuple[AutoDiagonalNormal, list]:
     """Train BNN with smooth loss curves - fixes loss jumps
 
-    Key improvements:
-    1. Learning rate warmup for first N epochs
-    2. Reduced initial learning rate
-    3. Better learning rate scheduling
+    Uses plain Adam with a constant learning rate; the reduced initial_lr
+    (vs train_targeted_bnn) is what smooths the loss curve.
 
     ``w_train`` is an optional per-star likelihood weight (shape ``(N,)``).
     When provided it is fed to the model's weighted likelihood so sparse age
@@ -569,7 +566,6 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
 
     print("\n" + "="*60)
     print("Training Smooth Bayesian Neural Network")
-    print("With Learning Rate Warmup and Better Stability")
     print("="*60)
 
     # Set seed if provided for reproducibility
@@ -594,20 +590,9 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     # Calculate number of epochs
     num_epochs = num_iterations // len(loader)
 
-    # Custom learning rate scheduler with warmup
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # Linear warmup
-            return (epoch + 1) / warmup_epochs
-        else:
-            # Cosine annealing after warmup
-            progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    # Use standard Adam optimizer with constant learning rate
+    # Standard Adam optimizer with constant learning rate
     from pyro.optim import Adam
 
-    # Keep it simple - just use the initial learning rate
     optimizer = Adam({"lr": initial_lr})
 
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
@@ -734,7 +719,6 @@ def main_targeted():
         num_iterations=8000,
         initial_lr=0.005,  # Reduced from 0.01
         batch_size=512,
-        warmup_epochs=20,  # Learning rate warmup
         seed=seed
     )
 

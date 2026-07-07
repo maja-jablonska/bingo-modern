@@ -78,8 +78,14 @@ def load(path):
     return df
 
 
-def clean_labels(df, name):
-    """Drop NaNs, unphysical ages, and (optionally) the clipped age ceiling."""
+def clean_labels(df, name, drop_saturated=False):
+    """Drop NaNs, unphysical ages, and (optionally) the clipped age ceiling.
+
+    ``drop_saturated=True`` removes stars older than UNPHYSICAL_AGE_GYR outright.
+    ``False`` (legacy) keeps them pinned at CAP_AGE_GYR, which piles a large
+    fraction of the sample onto a single fabricated label value — prefer True
+    unless you model the cap as a censored observation.
+    """
     n0 = len(df)
     report = {}
 
@@ -97,19 +103,23 @@ def clean_labels(df, name):
     df = df.dropna(subset=cols)
     report["dropped_nan"] = before - len(df)
 
-    # Cap unphysical ages instead of dropping them: saturated stars (older than the
-    # Universe) are kept but pinned to CAP_AGE_GYR, and logAge is recomputed to match
-    # (the catalog uses logAge = log10(age[Gyr])).
-    cap_log = float(np.log10(CAP_AGE_GYR))
     saturated = df["age"] > UNPHYSICAL_AGE_GYR
-    report["capped_unphysical_age"] = int(saturated.sum())
-    report["cap_age_gyr"] = CAP_AGE_GYR
-    df.loc[saturated, "age"] = CAP_AGE_GYR
-    df.loc[saturated, TARGET] = cap_log
-    if INFLATE_CAPPED_ERR:
-        # Treat the cap as a soft lower bound: widen the label error upward so SVI does
-        # not over-trust the exact 14 Gyr value. Floor of 0.3 dex is ~factor-2 in age.
-        df.loc[saturated, TARGET_ERR] = np.maximum(df.loc[saturated, TARGET_ERR], 0.3)
+    if drop_saturated:
+        # Ages older than the Universe are measurement failures, not old stars.
+        report["dropped_unphysical_age"] = int(saturated.sum())
+        df = df[~saturated]
+    else:
+        # Legacy: keep saturated stars pinned to CAP_AGE_GYR, with logAge recomputed
+        # to match (the catalog uses logAge = log10(age[Gyr])).
+        cap_log = float(np.log10(CAP_AGE_GYR))
+        report["capped_unphysical_age"] = int(saturated.sum())
+        report["cap_age_gyr"] = CAP_AGE_GYR
+        df.loc[saturated, "age"] = CAP_AGE_GYR
+        df.loc[saturated, TARGET] = cap_log
+        if INFLATE_CAPPED_ERR:
+            # Treat the cap as a soft lower bound: widen the label error upward so SVI
+            # does not over-trust the exact 14 Gyr value. 0.3 dex is ~factor-2 in age.
+            df.loc[saturated, TARGET_ERR] = np.maximum(df.loc[saturated, TARGET_ERR], 0.3)
 
     # Non-positive errors are unusable for the uncertainty model
     before = len(df)
