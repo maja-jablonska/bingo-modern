@@ -1,0 +1,32 @@
+#!/bin/bash
+# Classify the bulge catalog into RGB/RC on Gadi.
+#
+# Submit from the repo root:   qsub classify_bulge.pbs
+# Override the catalog path:   qsub -v BULGE=/path/to/catalog.parquet classify_bulge.pbs
+#
+# CPU-only and streamed in 500k-row chunks, so the resources below are enough
+# for any catalog size; bump walltime only if the file is truly enormous.
+
+#PBS -P mk27
+#PBS -q normal
+#PBS -l ncpus=4
+#PBS -l mem=16GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N classify_bulge
+#PBS -j oe
+
+set -eu
+
+# Environment with pandas, scikit-learn, joblib, pyarrow.
+# Adjust to however the BNN training env is set up on Gadi, e.g.:
+#   module load python3/3.11.7
+#   source /scratch/mk27/mj8805/envs/bingo/bin/activate
+module load python3
+
+REPO="${REPO:-$HOME/scr_mk27/bingo-modern}"
+BULGE="${BULGE:-$HOME/scr_mk27/bulge-ages-and-orbits/data/bulge_sample.parquet}"
+
+cd "$REPO"
+python3 classify_bulge.py --bulge "$BULGE" --out-dir ./RGB_RC_classifier
