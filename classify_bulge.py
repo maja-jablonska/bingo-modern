@@ -9,6 +9,13 @@ train_data/{rgb,rc}_clean_labels.parquet — identical data, params, and seed to
 the notebook, so results match. Ambiguous stars (thr_lo <= P(RC) <= thr_hi)
 are dropped; only the RGB and RC parquets are written.
 
+Column handling: each needed quantity is resolved against the catalog's actual
+schema (raw_teff or teff, mg_fe or raw_mg_fe, ...). [X/Fe] abundances missing
+from the catalog are derived as [X/H] - [Fe/H] when an _h column exists, with
+errors combined in quadrature. A missing ID column is synthesized from the row
+number. Only genuinely unresolvable classifier features are a hard error, and
+the message lists the catalog's columns.
+
 Usage:
     python classify_bulge.py --bulge /path/to/bulge_catalog.parquet
     python classify_bulge.py --bulge catalog.csv --out-dir ./RGB_RC_classifier \
@@ -36,7 +43,7 @@ THR_LO, THR_HI = 0.3, 0.7
 HGB_PARAMS = dict(max_leaf_nodes=15, l2_regularization=1.0, learning_rate=0.06,
                   random_state=SEED)
 
-# Astra label convention -> the FOO/FOO_ERR schema the age pipelines expect.
+# Canonical (training) column -> the FOO/FOO_ERR schema the age pipelines expect.
 FEATURE_MAP = {
     "APOGEE_ID": "APOGEE_ID",
     "raw_teff": "TEFF", "raw_e_teff": "TEFF_ERR",
@@ -48,7 +55,37 @@ FEATURE_MAP = {
 }
 # ---------------------------------------------------------------------------
 
-SOURCE_COLS = list(FEATURE_MAP)  # columns read from the bulge catalog
+# Direct alternatives per canonical column, first hit wins.
+DIRECT_ALTS = {
+    "APOGEE_ID": ["APOGEE_ID", "apogee_id", "sdss_id", "GAIADR3_ID", "gaiadr3_id",
+                  "gaia_dr3_source_id", "source_id"],
+    "raw_teff": ["raw_teff", "teff"],
+    "raw_e_teff": ["raw_e_teff", "e_teff"],
+    "raw_logg": ["raw_logg", "logg"],
+    "raw_e_logg": ["raw_e_logg", "e_logg"],
+    "raw_fe_h": ["raw_fe_h", "fe_h"],
+    "raw_e_fe_h": ["raw_e_fe_h", "e_fe_h"],
+    "mg_fe": ["mg_fe", "raw_mg_fe"],
+    "e_mg_fe": ["e_mg_fe", "raw_e_mg_fe"],
+    "c_fe": ["c_fe", "raw_c_fe"],
+    "e_c_fe": ["e_c_fe", "raw_e_c_fe"],
+    "n_fe": ["n_fe", "raw_n_fe"],
+    "e_n_fe": ["e_n_fe", "raw_e_n_fe"],
+}
+# Fallback [X/H] columns for deriving [X/Fe] = [X/H] - [Fe/H].
+XH_ALTS = {
+    "mg_fe": ["mg_h", "raw_mg_h"],
+    "c_fe": ["c_h", "raw_c_h"],
+    "n_fe": ["n_h", "raw_n_h"],
+}
+EH_ALTS = {
+    "e_mg_fe": ["e_mg_h", "raw_e_mg_h"],
+    "e_c_fe": ["e_c_h", "raw_e_c_h"],
+    "e_n_fe": ["e_n_h", "raw_e_n_h"],
+}
+# Columns the classifier itself needs values for; unresolvable => hard error.
+# (Missing errors or ID only degrade the output, so they just warn.)
+CRITICAL = ["raw_teff", "raw_logg", "raw_fe_h", "mg_fe", "c_fe", "n_fe"]
 
 
 def train_bundle(out_path):
@@ -95,18 +132,94 @@ def get_bundle(bundle_path, retrain):
     return train_bundle(bundle_path)
 
 
-def iter_chunks(path, batch_rows):
-    """Yield DataFrame chunks with only SOURCE_COLS, never the full catalog."""
+def build_plan(names):
+    """Resolve every canonical column against the catalog schema.
+
+    Returns (plan, read_cols): plan maps canonical name -> recipe tuple,
+    read_cols is the set of catalog columns actually needed.
+    """
+    nameset = set(names)
+    plan, read_cols, derived, missing = {}, set(), [], []
+
+    for target, alts in DIRECT_ALTS.items():
+        col = next((c for c in alts if c in nameset), None)
+        if col is not None:
+            plan[target] = ("direct", col)
+            read_cols.add(col)
+            continue
+        xh = next((c for c in XH_ALTS.get(target, []) if c in nameset), None)
+        if xh is not None:
+            plan[target] = ("xh_minus_feh", xh)
+            read_cols.add(xh)
+            derived.append(f"{target} = {xh} - [Fe/H]")
+            continue
+        eh = next((c for c in EH_ALTS.get(target, []) if c in nameset), None)
+        if eh is not None:
+            plan[target] = ("quad_feh_err", eh)
+            read_cols.add(eh)
+            derived.append(f"{target} = sqrt({eh}^2 + e_fe_h^2)")
+            continue
+        plan[target] = ("missing",)
+        missing.append(target)
+
+    unresolvable = [t for t in CRITICAL if plan[t][0] == "missing"]
+    if unresolvable:
+        raise KeyError(
+            f"cannot resolve classifier features {unresolvable} from the catalog "
+            f"(no direct or [X/H] fallback column). Catalog columns:\n  "
+            + "\n  ".join(sorted(names)))
+
+    if derived:
+        print("Derived columns: " + "; ".join(derived))
+    for t in missing:
+        if t == "APOGEE_ID":
+            print("No ID column found -- synthesizing row_<N> IDs")
+        else:
+            print(f"WARNING: no source for {t} -- writing NaN "
+                  f"({FEATURE_MAP[t]} in the output; the age pipelines need it)")
+    return plan, sorted(read_cols)
+
+
+def canonicalize(chunk, plan, row_offset):
+    """Build the canonical-schema frame for one chunk."""
+    out = pd.DataFrame(index=chunk.index)
+    # [Fe/H] and its error first: the derivations below need them.
+    for target in ["raw_fe_h", "raw_e_fe_h"]:
+        if plan[target][0] == "direct":
+            out[target] = chunk[plan[target][1]]
+        else:
+            out[target] = np.nan
+    for target, recipe in plan.items():
+        kind = recipe[0]
+        if kind == "direct":
+            out[target] = chunk[recipe[1]]
+        elif kind == "xh_minus_feh":
+            out[target] = chunk[recipe[1]] - out["raw_fe_h"]
+        elif kind == "quad_feh_err":
+            out[target] = np.sqrt(chunk[recipe[1]] ** 2 + out["raw_e_fe_h"] ** 2)
+        elif target == "APOGEE_ID":
+            out[target] = [f"row_{i}" for i in
+                           range(row_offset, row_offset + len(chunk))]
+        else:
+            out[target] = np.nan
+    out["c_n"] = out["c_fe"] - out["n_fe"]
+    return out
+
+
+def get_schema_names(path):
+    if path.suffix == ".parquet":
+        return pq.ParquetFile(path).schema_arrow.names
+    return list(pd.read_csv(path, nrows=0).columns)
+
+
+def iter_chunks(path, read_cols, batch_rows):
+    """Yield DataFrame chunks with only read_cols, never the full catalog."""
     if path.suffix == ".parquet":
         pf = pq.ParquetFile(path)
-        missing = [c for c in SOURCE_COLS if c not in pf.schema_arrow.names]
-        if missing:
-            raise KeyError(f"{path.name} is missing columns {missing}; "
-                           f"adjust FEATURE_MAP for its schema")
-        for batch in pf.iter_batches(batch_size=batch_rows, columns=SOURCE_COLS):
+        for batch in pf.iter_batches(batch_size=batch_rows, columns=read_cols):
             yield batch.to_pandas()
     else:
-        yield from pd.read_csv(path, usecols=SOURCE_COLS, chunksize=batch_rows)
+        yield from pd.read_csv(path, usecols=read_cols, chunksize=batch_rows)
 
 
 def main():
@@ -128,6 +241,8 @@ def main():
     thr_lo, thr_hi = bundle["thr_lo"], bundle["thr_hi"]
     feats = bundle["features"]
 
+    plan, read_cols = build_plan(get_schema_names(bulge_path))
+
     keep = list(FEATURE_MAP.values()) + ["p_rc", "evo_class", "in_domain"]
     float_cols = [c for c in keep if c not in ("APOGEE_ID", "evo_class", "in_domain")]
     out_paths = {cls: args.out_dir / f"bulge_{cls.lower()}_bnn.parquet"
@@ -136,10 +251,10 @@ def main():
     stats = {"rows": 0, "nan": 0, "ambiguous": 0, "RGB": 0, "RC": 0, "in_domain": 0}
 
     try:
-        for chunk in iter_chunks(bulge_path, args.batch_rows):
+        for raw_chunk in iter_chunks(bulge_path, read_cols, args.batch_rows):
+            chunk = canonicalize(raw_chunk, plan, stats["rows"])
             n_in = len(chunk)
             stats["rows"] += n_in
-            chunk["c_n"] = chunk["c_fe"] - chunk["n_fe"]
             chunk = chunk.dropna(subset=feats)
             stats["nan"] += n_in - len(chunk)
             if chunk.empty:
