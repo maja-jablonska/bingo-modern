@@ -1,0 +1,44 @@
+#!/bin/bash
+# Apply the trained BINGO BNN age model to a classified bulge sample on Gadi.
+#
+# Prereqs (once per evolutionary state):
+#   1. classify_bulge.pbs has produced RGB_RC_classifier/bulge_{rgb,rc}_bnn.parquet
+#   2. the training notebook has been run so BNN_targeted_output_RGB/ holds
+#      bnn_inference_bundle_rgb.pkl + targeted_bnn_params.pth (same for RC)
+#
+# Submit from the repo root, once per state:
+#   qsub predict_bulge_ages.pbs                                        # RGB default
+#   qsub -v STATE=rc,BUNDLE=BNN_targeted_output_RC/bnn_inference_bundle_rc.pkl \
+#        predict_bulge_ages.pbs
+#
+# The net is tiny (7 -> 32 hidden), so CPU is fine; for a many-million-star
+# catalog switch to one GPU:  -q gpuvolta -l ngpus=1 -l ncpus=12 -l mem=90GB
+
+#PBS -P mk27
+#PBS -q normal
+#PBS -l ncpus=8
+#PBS -l mem=32GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N predict_ages
+#PBS -j oe
+
+set -eu
+
+# Environment with torch, pyro, pandas, pyarrow, joblib, scikit-learn.
+# Use the same env the BNN training notebook runs in, e.g.:
+#   source /scratch/mk27/mj8805/envs/bingo/bin/activate
+module load python3
+
+REPO="${REPO:-$HOME/scr_mk27/bingo-modern}"
+STATE="${STATE:-rgb}"
+INPUT="${INPUT:-$REPO/RGB_RC_classifier/bulge_${STATE}_bnn.parquet}"
+BUNDLE="${BUNDLE:-$REPO/BNN_targeted_output_RGB/bnn_inference_bundle_rgb.pkl}"
+
+cd "$REPO"
+python3 predict_bulge_ages.py \
+    --input "$INPUT" \
+    --bundle "$BUNDLE" \
+    --num-samples 1000 \
+    --batch-rows 20000
