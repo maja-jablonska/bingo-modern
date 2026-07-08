@@ -552,16 +552,27 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
                     initial_lr: float = 0.005,  # Reduced from 0.01
                     batch_size: int = 512,
                     seed: int = None,
-                    w_train: Optional[torch.Tensor] = None) -> Tuple[AutoDiagonalNormal, list]:
+                    w_train: Optional[torch.Tensor] = None,
+                    minibatch_scale: bool = False,
+                    lr_decay_per_epoch: float = 1.0) -> Tuple[AutoDiagonalNormal, list]:
     """Train BNN with smooth loss curves - fixes loss jumps
 
     Uses plain Adam with a constant learning rate; the reduced initial_lr
-    (vs train_targeted_bnn) is what smooths the loss curve.
+    (vs train_targeted_bnn) is what smooths the loss curve. Set
+    ``lr_decay_per_epoch`` < 1 to instead decay the learning rate by that
+    factor each epoch (ClippedAdam).
 
     ``w_train`` is an optional per-star likelihood weight (shape ``(N,)``).
     When provided it is fed to the model's weighted likelihood so sparse age
     bins are not drowned out by the bulk of the distribution. ``None`` keeps the
     original unweighted behaviour.
+
+    ``minibatch_scale=True`` multiplies each batch's likelihood weights by
+    ``N_train / len(batch)`` so the data term is scaled to the full dataset
+    against the once-per-step KL (minibatch-correct ELBO). This uses the
+    *actual* batch length, so the ragged last batch is scaled correctly —
+    callers should pass bare (mean ~1) weights and NOT pre-multiply by
+    ``N / batch_size`` themselves.
     """
 
     print("\n" + "="*60)
@@ -590,10 +601,15 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     # Calculate number of epochs
     num_epochs = num_iterations // len(loader)
 
-    # Standard Adam optimizer with constant learning rate
-    from pyro.optim import Adam
+    # Standard Adam with constant LR, or ClippedAdam with per-epoch decay
+    from pyro.optim import Adam, ClippedAdam
 
-    optimizer = Adam({"lr": initial_lr})
+    if lr_decay_per_epoch < 1.0:
+        # ClippedAdam decays per *step*; convert the per-epoch factor.
+        optimizer = ClippedAdam({"lr": initial_lr,
+                                 "lrd": lr_decay_per_epoch ** (1.0 / len(loader))})
+    else:
+        optimizer = Adam({"lr": initial_lr})
 
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
@@ -603,8 +619,11 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
 
     print(f"Training for {num_epochs} epochs with {len(loader)} batches per epoch...")
     print(f"Total iterations: {num_iterations}")
-    print(f"Initial learning rate: {initial_lr}")
+    print(f"Initial learning rate: {initial_lr}"
+          + (f" (decay {lr_decay_per_epoch}/epoch)" if lr_decay_per_epoch < 1.0 else " (constant)"))
     print(f"Batch size: {batch_size} (covers {100*batch_size/len(X_train):.1f}% of data per batch)")
+    if minibatch_scale:
+        print(f"Minibatch ELBO scaling: likelihood x N/len(batch) (~{len(X_train)/batch_size:.1f})")
 
     pbar = tqdm(range(num_epochs), desc="Training")
     best_loss = float('inf')
@@ -614,6 +633,8 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
         batch_losses = []
 
         for batch_x, batch_x_err, batch_y, batch_y_err, batch_w in loader:
+            if minibatch_scale:
+                batch_w = batch_w * (len(X_train) / len(batch_x))
             loss = svi.step(batch_x, batch_x_err, batch_y, batch_y_err, batch_w)
             epoch_loss += loss
             batch_losses.append(loss)
@@ -636,7 +657,7 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
         pbar.set_postfix({
             'loss': f'{avg_loss:.2f}',
             'smooth': f'{smoothed_loss:.2f}',
-            'lr': f'{initial_lr:.5f}',
+            'lr': f'{initial_lr * lr_decay_per_epoch ** (epoch + 1):.5f}',
         })
 
         # Print progress every 100 epochs
