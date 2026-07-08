@@ -28,6 +28,7 @@ from pyro.infer import SVI, Trace_ELBO, Predictive
 from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.optim import Adam
 from typing import Tuple, Optional, Dict, List
+import copy
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
@@ -554,7 +555,17 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
                     seed: int = None,
                     w_train: Optional[torch.Tensor] = None,
                     minibatch_scale: bool = False,
-                    lr_decay_per_epoch: float = 1.0) -> Tuple[AutoDiagonalNormal, list]:
+                    lr_decay_per_epoch: float = 1.0,
+                    X_val: Optional[torch.Tensor] = None,
+                    X_err_val: Optional[torch.Tensor] = None,
+                    y_val: Optional[torch.Tensor] = None,
+                    y_err_val: Optional[torch.Tensor] = None,
+                    early_stopping: bool = False,
+                    patience: int = 10,
+                    min_delta: float = 0.0,
+                    eval_every: int = 5,
+                    restore_best: bool = True,
+                    val_mc_samples: int = 5) -> Tuple[AutoDiagonalNormal, list]:
     """Train BNN with smooth loss curves - fixes loss jumps
 
     Uses plain Adam with a constant learning rate; the reduced initial_lr
@@ -573,6 +584,23 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     *actual* batch length, so the ragged last batch is scaled correctly —
     callers should pass bare (mean ~1) weights and NOT pre-multiply by
     ``N / batch_size`` themselves.
+
+    Early stopping
+    --------------
+    Pass a validation split (``X_val, X_err_val, y_val, y_err_val``) and set
+    ``early_stopping=True`` to monitor the *unweighted* validation ELBO every
+    ``eval_every`` epochs. Training stops after ``patience`` consecutive
+    evaluations without an improvement of at least ``min_delta`` (in ELBO/nat),
+    and (if ``restore_best``) the Pyro param store is rewound to the best
+    checkpoint. The validation ELBO is averaged over ``val_mc_samples`` guide
+    draws (it is stochastic) and computed with the model in eval mode, so input
+    noise is disabled and the metric is comparable across epochs.
+
+    Backward compatible: with ``early_stopping=False`` (default) the loop runs
+    the full ``num_iterations`` exactly as before. Regardless of the setting,
+    the following diagnostics are attached to ``model`` for the caller to plot:
+    ``model.val_losses_`` (list of ``(epoch, val_elbo)``), ``model.best_epoch_``,
+    and ``model.stopped_epoch_``.
     """
 
     print("\n" + "="*60)
@@ -613,6 +641,26 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
 
     svi = SVI(model, guide, optimizer, loss=Trace_ELBO())
 
+    # --- Early-stopping / validation setup ---------------------------------
+    have_val = all(v is not None for v in (X_val, X_err_val, y_val, y_err_val))
+    if early_stopping and not have_val:
+        raise ValueError(
+            "early_stopping=True requires X_val, X_err_val, y_val, y_err_val")
+
+    def _val_elbo():
+        """Unweighted validation ELBO (loss/nat), model in eval mode so input
+        noise is off. Averaged over a few guide draws since it is stochastic."""
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                vals = [svi.evaluate_loss(X_val, X_err_val, y_val, y_err_val)
+                        for _ in range(max(1, val_mc_samples))]
+        finally:
+            if was_training:
+                model.train()
+        return float(np.mean(vals))
+
     # Training loop with better monitoring
     losses = []
     smoothed_losses = []
@@ -624,9 +672,20 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     print(f"Batch size: {batch_size} (covers {100*batch_size/len(X_train):.1f}% of data per batch)")
     if minibatch_scale:
         print(f"Minibatch ELBO scaling: likelihood x N/len(batch) (~{len(X_train)/batch_size:.1f})")
+    if early_stopping:
+        print(f"Early stopping: monitor val ELBO every {eval_every} epoch(s), "
+              f"patience {patience}, min_delta {min_delta}")
 
     pbar = tqdm(range(num_epochs), desc="Training")
     best_loss = float('inf')
+
+    # Early-stopping bookkeeping (also exposed on the model for plotting).
+    val_losses = []                 # list of (epoch, val_elbo)
+    best_val = float('inf')
+    best_epoch = -1
+    best_state = None
+    evals_no_improve = 0
+    stopped_epoch = num_epochs - 1
 
     for epoch in pbar:
         epoch_loss = 0.0
@@ -653,12 +712,40 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
         if smoothed_loss < best_loss:
             best_loss = smoothed_loss
 
-        # Update progress bar with more info
-        pbar.set_postfix({
+        # Progress-bar fields (val added below when it is evaluated).
+        postfix = {
             'loss': f'{avg_loss:.2f}',
             'smooth': f'{smoothed_loss:.2f}',
             'lr': f'{initial_lr * lr_decay_per_epoch ** (epoch + 1):.5f}',
-        })
+        }
+
+        # --- Validation / early stopping ----------------------------------
+        if early_stopping and ((epoch + 1) % eval_every == 0
+                               or epoch == num_epochs - 1):
+            val_loss = _val_elbo()
+            val_losses.append((epoch, val_loss))
+            postfix['val'] = f'{val_loss:.2f}'
+
+            if val_loss < best_val - min_delta:
+                best_val = val_loss
+                best_epoch = epoch
+                evals_no_improve = 0
+                if restore_best:
+                    # Snapshot the whole param store so we can rewind later.
+                    best_state = copy.deepcopy(pyro.get_param_store().get_state())
+            else:
+                evals_no_improve += 1
+            postfix['best_val'] = f'{best_val:.2f}'
+
+            if evals_no_improve >= patience:
+                stopped_epoch = epoch
+                pbar.set_postfix(postfix)
+                print(f"\nEarly stopping at epoch {epoch+1}: no val-ELBO "
+                      f"improvement for {patience} evals "
+                      f"(best {best_val:.4f} @ epoch {best_epoch+1}).")
+                break
+
+        pbar.set_postfix(postfix)
 
         # Print progress every 100 epochs
         if (epoch + 1) % 100 == 0:
@@ -666,10 +753,23 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
             print(f"Epoch {epoch+1}/{num_epochs}: Loss = {avg_loss:.4f} ± {loss_std:.4f}, "
                   f"Smoothed = {smoothed_loss:.4f}")
 
+    # Rewind to the best validation checkpoint, if we kept one.
+    if early_stopping and restore_best and best_state is not None:
+        pyro.get_param_store().set_state(best_state)
+        print(f"Restored best params from epoch {best_epoch+1} "
+              f"(val ELBO {best_val:.4f}).")
+
+    # Expose diagnostics for the caller (kept even when early stopping is off).
+    model.val_losses_ = val_losses
+    model.best_epoch_ = best_epoch
+    model.stopped_epoch_ = stopped_epoch
+
     print(f"\nTraining complete!")
     print(f"Final loss: {losses[-1]:.4f}")
     print(f"Final smoothed loss: {smoothed_losses[-1]:.4f}")
     print(f"Best smoothed loss: {best_loss:.4f}")
+    if early_stopping and val_losses:
+        print(f"Best val ELBO: {best_val:.4f} @ epoch {best_epoch+1}")
     print(f"Loss improvement: {losses[0] - losses[-1]:.4f}")
 
     return guide, losses
