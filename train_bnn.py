@@ -108,7 +108,9 @@ class BayesianNeuralNetwork(PyroModule):
                  use_skip_connections: bool = False,  # Disabled by default
                  use_empirical_output_bias: bool = False,  # Disabled by default
                  use_leaky_relu: bool = False,  # Standard ReLU by default
-                 y_mean: float = 0.0, y_std: float = 1.0):
+                 y_mean: float = 0.0, y_std: float = 1.0,
+                 intrinsic_scatter_prior: float = 0.1,
+                 intrinsic_scatter_prior_logstd: float = 0.3):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -117,6 +119,14 @@ class BayesianNeuralNetwork(PyroModule):
         self.use_leaky_relu = use_leaky_relu
         self.y_mean = y_mean
         self.y_std = y_std
+        # Prior on the GLOBAL intrinsic scatter: log_std ~ Normal(log(prior),
+        # logstd). This term enters every star's likelihood additively, so a
+        # loose prior lets it absorb structure the network should explain (the
+        # RGB run fit 0.317 dex against a 0.1 dex prior mean -- ~4 prior-sigma
+        # out) and makes near-the-mean predictions nearly free. Tighten it to
+        # push scatter into the per-star variance network instead.
+        self.intrinsic_scatter_prior = intrinsic_scatter_prior
+        self.intrinsic_scatter_prior_logstd = intrinsic_scatter_prior_logstd
 
         # Device anchor buffer: moves with .to(device) so priors/samples can be
         # built on the correct device lazily (PyroSample weights are NOT moved
@@ -266,10 +276,12 @@ class BayesianNeuralNetwork(PyroModule):
         log_intrinsic_std = pyro.sample(
             "log_intrinsic_std",
             dist.Normal(
-                torch.as_tensor(np.log(0.1), dtype=anchor.dtype, device=anchor.device),
-                torch.as_tensor(0.3, dtype=anchor.dtype, device=anchor.device),
+                torch.as_tensor(np.log(self.intrinsic_scatter_prior),
+                                dtype=anchor.dtype, device=anchor.device),
+                torch.as_tensor(self.intrinsic_scatter_prior_logstd,
+                                dtype=anchor.dtype, device=anchor.device),
             ),
-        )  # Tighter prior
+        )
         intrinsic_var = torch.exp(log_intrinsic_std) ** 2
 
         # Register outputs
