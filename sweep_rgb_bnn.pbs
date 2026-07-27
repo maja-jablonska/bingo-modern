@@ -1,22 +1,25 @@
 #!/bin/bash
-# Hyperparameter sweep for the RGB stellar-age BNN on Gadi: one GPU job per
-# grid config (48 total; see `python3 sweep_rgb_bnn.py --list`).
+# Hyperparameter sweep for the RGB stellar-age BNN on Gadi: ALL grid configs
+# (48; see `python3 sweep_rgb_bnn.py --list`) run SEQUENTIALLY on one GPU.
 #
 # Submit from the repo root:
 #   qsub sweep_rgb_bnn.pbs
 #
-# If job arrays are restricted on your project, submit individually instead:
-#   for i in $(seq 0 47); do qsub -v SWEEP_INDEX=$i sweep_rgb_bnn.pbs; done
-# (and delete the #PBS -J line)
+# Resumable: configs whose result JSON already exists are skipped, so if the
+# walltime runs out partway through, just qsub again and it continues where it
+# stopped. A single failed config is logged and skipped, not fatal.
+#
+# To run only one config (e.g. a re-run of a failed one):
+#   qsub -v SWEEP_INDEX=7 sweep_rgb_bnn.pbs
 #
 # wandb: Gadi COMPUTE NODES HAVE NO INTERNET, so every run is logged in
-# offline mode into sweep_results/wandb/. After the array finishes, sync from
+# offline mode into sweep_results/wandb/. After the sweep finishes, sync from
 # a LOGIN node (which does have internet; needs `wandb login` done once):
 #   wandb sync sweep_results/wandb/offline-run-*
 # Project name defaults to "bingo-rgb-bnn-sweep"; override with WANDB_PROJECT.
 # To skip wandb entirely: qsub -v SWEEP_NO_WANDB=1 sweep_rgb_bnn.pbs
 #
-# When the array finishes, rank the results (no test data is touched):
+# When the sweep finishes, rank the results (no test data is touched):
 #   python3 sweep_rgb_bnn.py --collect
 # then promote the winning config into train_pipeline_rgb.ipynb and run the
 # notebook for the one-and-only test evaluation.
@@ -26,14 +29,13 @@
 #PBS -l ngpus=1
 #PBS -l ncpus=12
 #PBS -l mem=90GB
-#PBS -l walltime=02:00:00
+#PBS -l walltime=48:00:00
 #PBS -l storage=scratch/mk27+scratch/y89
 #PBS -l wd
 #PBS -N sweep_bnn
-#PBS -J 0-47
 #PBS -j oe
 
-set -eu
+set -u
 
 # Same env the training notebook runs in (torch, pyro, pandas, scikit-learn,
 # wandb -- `pip install wandb` into the env if missing).
@@ -47,6 +49,24 @@ cd "$REPO"
 # and are synced later from a login node.
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-INDEX="${SWEEP_INDEX:-${PBS_ARRAY_INDEX:?no SWEEP_INDEX or PBS_ARRAY_INDEX set}}"
-python3 sweep_rgb_bnn.py --index "$INDEX" --outdir sweep_results \
-    ${SWEEP_NO_WANDB:+--no-wandb}
+OUTDIR=sweep_results
+mkdir -p "$OUTDIR"
+
+N_CONFIGS=$(python3 sweep_rgb_bnn.py --list | wc -l)
+INDICES="${SWEEP_INDEX:-$(seq 0 $((N_CONFIGS - 1)))}"
+
+for i in $INDICES; do
+    result="$OUTDIR/$(printf 'result_%03d.json' "$i")"
+    if [ -f "$result" ]; then
+        echo "== config $i: $result exists, skipping"
+        continue
+    fi
+    echo "== config $i: starting at $(date)"
+    if ! python3 sweep_rgb_bnn.py --index "$i" --outdir "$OUTDIR" \
+            ${SWEEP_NO_WANDB:+--no-wandb}; then
+        echo "== config $i: FAILED (continuing with the next one)"
+    fi
+done
+
+echo "== sweep pass complete at $(date):" \
+     "$(ls "$OUTDIR"/result_*.json 2>/dev/null | wc -l)/$N_CONFIGS results"
