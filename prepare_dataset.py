@@ -78,6 +78,124 @@ def load(path):
     return df
 
 
+def _first_col(df, candidates, what):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"None of the candidate columns for {what} found: {candidates}. "
+                   f"Available: {sorted(df.columns.tolist())}")
+
+
+def load_willett_merged(path, target_state="rgb", impostor_cut=True,
+                        selection_file=None):
+    """Load the all-missions merged catalog (merged_with_ages_raw.parquet) and
+    return a dataframe in the BNN column convention (BASE_FEATURES + errors,
+    logAge/logAgeErr/age, APOGEE_ID, SNR), ready for clean_labels().
+
+    Selection mirrors AnniesLasso/notebooks/train_rgb_wilett_all_missions.ipynb:
+      1. finite Willett age (age_L)
+      2. ASPCAP sentinel rows dropped (raw_* < -100; isfinite does not catch them)
+      3. RelAge_L == False (unreliable reference age) dropped
+      4. young alpha-rich impostors dropped (age_L < 4 Gyr, mg_fe > 0.15,
+         c_n > -0.2): predominantly mass-transfer/merger products whose
+         reference ages are wrong (set impostor_cut=False to keep them)
+      5. evolutionary state: seismic EvoState (1=RGB, 2=HeB/RC; Kepler only).
+         K2/TESS rows have no EvoState -- the Cannon notebook classifies them
+         from the normalized spectra, which this loader cannot do. Pass
+         ``selection_file`` (a parquet/csv with the ID column + boolean
+         ``is_rgb``, persisted from that notebook) to reuse its selection;
+         otherwise only seismically labeled stars survive.
+
+    Spectra columns (wavelength/flux/ivar) are never read.
+    """
+    import pyarrow.parquet as pq
+    spectra_cols = {"wavelength", "flux", "ivar"}
+    names = pq.ParquetFile(path).schema_arrow.names
+    df = pd.read_parquet(path, columns=[c for c in names if c not in spectra_cols])
+    n0 = len(df)
+
+    df = df[np.isfinite(df["age_L"])]
+
+    # Abundance ratios from the Astra raw_*_h convention (X/Fe = X/H - Fe/H).
+    for out, xh in [("mg_fe", "raw_mg_h"), ("c_fe", "raw_c_h"), ("n_fe", "raw_n_h")]:
+        if out not in df.columns:
+            df[out] = df[xh] - df["raw_fe_h"]
+    if "c_n" not in df.columns:
+        df["c_n"] = df["raw_c_h"] - df["raw_n_h"]
+
+    sentinel_cols = [c for c in ("raw_teff", "raw_logg", "raw_fe_h", "raw_mg_h",
+                                 "raw_c_h", "raw_n_h") if c in df.columns]
+    sentinel = (df[sentinel_cols] < -100).any(axis=1)
+    unreliable = ~df["RelAge_L"].astype(bool)
+    impostor = ((df["age_L"] < 4) & (df["mg_fe"] > 0.15) & (df["c_n"] > -0.2)
+                if impostor_cut else pd.Series(False, index=df.index))
+    drop = sentinel | unreliable | impostor
+    print(f"[merged catalog] {n0} rows -> {len(df)} with finite age_L; dropping "
+          f"sentinel={int(sentinel.sum())}, RelAge_L=False={int(unreliable.sum())}, "
+          f"impostors={int(impostor.sum())} (overlapping) -> {int((~drop).sum())} remain")
+    df = df[~drop].reset_index(drop=True)
+
+    id_col = _first_col(df, ["APOGEE_ID", "apogee_id", "sdss_id", "GAIADR3_ID"], "star ID")
+    state_code = {"rgb": 1, "rc": 2}[target_state]
+    if selection_file is not None:
+        sel = (pd.read_parquet(selection_file) if str(selection_file).endswith(".parquet")
+               else pd.read_csv(selection_file))
+        sel_id = _first_col(sel, [id_col, "APOGEE_ID", "sdss_id"], "selection-file ID")
+        keep_ids = set(sel.loc[sel["is_rgb"].astype(bool), sel_id])
+        keep = df[id_col].isin(keep_ids)
+        print(f"[state] selection file {selection_file}: {int(keep.sum())} of "
+              f"{len(df)} rows kept")
+    else:
+        evo = pd.to_numeric(df.get("EvoState"), errors="coerce").fillna(0).astype(int)
+        keep = evo == state_code
+        n_missing = int((evo == 0).sum())
+        print(f"[state] seismic EvoState=={state_code} only: {int(keep.sum())} of "
+              f"{len(df)} rows kept ({n_missing} rows have no seismic state -- "
+              "mostly K2/TESS; pass selection_file to include their classified subset)")
+    if "source" in df.columns:
+        print(df.loc[keep, "source"].value_counts().to_string())
+    df = df[keep].reset_index(drop=True)
+
+    # Map to the BNN column convention consumed by the rest of this module.
+    out = pd.DataFrame()
+    out[ID_COL] = df[id_col].astype(str)
+    snr = next((c for c in ("snr", "SNR", "snr_x", "raw_snr") if c in df.columns), None)
+    out["SNR"] = df[snr] if snr else 1.0
+    out["TEFF"] = df["raw_teff"]
+    out["TEFF_ERR"] = df[_first_col(df, ["raw_e_teff", "e_teff"], "Teff error")]
+    out["LOGG"] = df["raw_logg"]
+    out["LOGG_ERR"] = df[_first_col(df, ["raw_e_logg", "e_logg"], "logg error")]
+    out["FE_H"] = df["raw_fe_h"]
+    fe_err = df[_first_col(df, ["raw_e_fe_h", "e_fe_h"], "Fe/H error")]
+    out["FE_H_ERR"] = fe_err
+    for feat, xh, exh in [("MG_FE", "raw_mg_h", ["raw_e_mg_h", "e_mg_fe"]),
+                          ("C_FE", "raw_c_h", ["raw_e_c_h", "e_c_fe"]),
+                          ("N_FE", "raw_n_h", ["raw_e_n_h", "e_n_fe"])]:
+        out[feat] = df[xh] - df["raw_fe_h"]
+        ecol = _first_col(df, exh, f"{feat} error")
+        # raw_e_*_h errors combine with Fe/H in quadrature for the ratio;
+        # e_*_fe columns are already ratio errors.
+        out[f"{feat}_ERR"] = (np.sqrt(df[ecol] ** 2 + fe_err ** 2)
+                              if ecol.startswith("raw_e_") else df[ecol])
+
+    out["age"] = df["age_L"]
+    out[TARGET] = np.log10(df["age_L"])
+    if "log_age_L_err" in df.columns:
+        out[TARGET_ERR] = df["log_age_L_err"]
+    elif any(c in df.columns for c in ("e_age_L", "age_L_err")):
+        e = df[_first_col(df, ["e_age_L", "age_L_err"], "age error")]
+        out[TARGET_ERR] = e / (df["age_L"] * np.log(10.0))
+    elif any(c in df.columns for c in ("age_16_L", "age_L_16")):
+        lo = df[_first_col(df, ["age_16_L", "age_L_16"], "age 16th pct")]
+        hi = df[_first_col(df, ["age_84_L", "age_L_84"], "age 84th pct")]
+        out[TARGET_ERR] = (np.log10(hi) - np.log10(lo)) / 2.0
+    else:
+        age_like = [c for c in df.columns if "age" in c.lower()]
+        raise KeyError("No Willett age-uncertainty column found. Age-related "
+                       f"columns available: {age_like}")
+    return out
+
+
 def clean_labels(df, name, drop_saturated=False):
     """Drop NaNs, unphysical ages, and (optionally) the clipped age ceiling.
 
@@ -133,11 +251,20 @@ def clean_labels(df, name, drop_saturated=False):
 
 
 def derive_features(df):
-    """Add [C/N] and its propagated error from C_FE, N_FE."""
+    """Add [C/N] and Salaris-corrected [M/H], each with propagated errors."""
     df = df.copy()
     df["C_N"] = df["C_FE"] - df["N_FE"]
     # Independent errors add in quadrature for a difference.
     df["C_N_ERR"] = np.sqrt(df["C_FE_ERR"] ** 2 + df["N_FE_ERR"] ** 2)
+    # Salaris et al. (1993) alpha-corrected global metallicity, with [Mg/Fe] as
+    # the alpha proxy: [M/H] = [Fe/H] + log10(0.638 * 10^[a/Fe] + 0.362).
+    # Captures the combined metallicity+alpha effect on the giant branch more
+    # directly than [Fe/H] and [Mg/Fe] separately.
+    alpha_term = 0.638 * 10.0 ** df["MG_FE"]
+    df["M_H"] = df["FE_H"] + np.log10(alpha_term + 0.362)
+    # d[M/H]/d[Fe/H] = 1;  d[M/H]/d[Mg/Fe] = alpha_term / (alpha_term + 0.362)
+    dmg = alpha_term / (alpha_term + 0.362)
+    df["M_H_ERR"] = np.sqrt(df["FE_H_ERR"] ** 2 + (dmg * df["MG_FE_ERR"]) ** 2)
     return df
 
 
