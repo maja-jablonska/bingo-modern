@@ -162,9 +162,12 @@ def main():
     )
     model.to(device)
 
-    # Load trained parameters
+    # Load trained parameters. ParamStore.load uses torch.load's
+    # weights_only=True default (torch >= 2.6), which rejects the constraint
+    # objects Pyro pickles into the checkpoint; load the state ourselves.
     print(f"\nLoading model parameters from {param_path}")
-    pyro.get_param_store().load(param_path)
+    state = torch.load(param_path, map_location=device, weights_only=False)
+    pyro.get_param_store().set_state(state)
 
     # Create guide
     guide = AutoDiagonalNormal(model)
