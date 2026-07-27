@@ -1,0 +1,52 @@
+#!/bin/bash
+# Hyperparameter sweep for the RGB stellar-age BNN on Gadi: one GPU job per
+# grid config (48 total; see `python3 sweep_rgb_bnn.py --list`).
+#
+# Submit from the repo root:
+#   qsub sweep_rgb_bnn.pbs
+#
+# If job arrays are restricted on your project, submit individually instead:
+#   for i in $(seq 0 47); do qsub -v SWEEP_INDEX=$i sweep_rgb_bnn.pbs; done
+# (and delete the #PBS -J line)
+#
+# wandb: Gadi COMPUTE NODES HAVE NO INTERNET, so every run is logged in
+# offline mode into sweep_results/wandb/. After the array finishes, sync from
+# a LOGIN node (which does have internet; needs `wandb login` done once):
+#   wandb sync sweep_results/wandb/offline-run-*
+# Project name defaults to "bingo-rgb-bnn-sweep"; override with WANDB_PROJECT.
+# To skip wandb entirely: qsub -v SWEEP_NO_WANDB=1 sweep_rgb_bnn.pbs
+#
+# When the array finishes, rank the results (no test data is touched):
+#   python3 sweep_rgb_bnn.py --collect
+# then promote the winning config into train_pipeline_rgb.ipynb and run the
+# notebook for the one-and-only test evaluation.
+
+#PBS -P mk27
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=90GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=scratch/mk27+scratch/y89
+#PBS -l wd
+#PBS -N sweep_bnn
+#PBS -J 0-47
+#PBS -j oe
+
+set -eu
+
+# Same env the training notebook runs in (torch, pyro, pandas, scikit-learn,
+# wandb -- `pip install wandb` into the env if missing).
+source /scratch/y89/mj8805/miniforge/etc/profile.d/conda.sh
+conda activate astro
+
+REPO="${REPO:-$HOME/scr_mk27/bingo-modern}"
+cd "$REPO"
+
+# Offline wandb on compute nodes (no internet); runs land in sweep_results/wandb
+# and are synced later from a login node.
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
+INDEX="${SWEEP_INDEX:-${PBS_ARRAY_INDEX:?no SWEEP_INDEX or PBS_ARRAY_INDEX set}}"
+python3 sweep_rgb_bnn.py --index "$INDEX" --outdir sweep_results \
+    ${SWEEP_NO_WANDB:+--no-wandb}
