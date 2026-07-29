@@ -30,10 +30,17 @@ import prepare_dataset as prep
 # --- must match train_pipeline_rgb.ipynb ------------------------------------
 DATASET = os.environ.get("SWEEP_DATASET", os.path.expanduser(
     "~/scr_mk27/bulge-ages-and-orbits/data/merged_with_ages_raw.parquet"))
-SELECTION_FILE = os.environ.get("SWEEP_SELECTION_FILE") or None
+# RGB selection persisted by the Cannon notebook (adds classifier-accepted
+# K2/TESS stars); falls back to seismic-only if the file is absent.
+_DEFAULT_SELECTION = os.path.expanduser(
+    "~/scr_mk27/bulge-ages-and-orbits/data/rgb_selection_all_missions.parquet")
+SELECTION_FILE = (os.environ.get("SWEEP_SELECTION_FILE")
+                  or (_DEFAULT_SELECTION if os.path.exists(_DEFAULT_SELECTION)
+                      else None))
 SEED = 42
 TEST_FRAC = 0.20
 VAL_FRAC = 0.15
+MAX_LOGAGE_ERR = 0.3   # dex; drop stars with less-precise Willett ages (None = off)
 NUM_ITERATIONS = 20000
 ES_PATIENCE = 8
 ES_EVAL_EVERY = 5
@@ -59,6 +66,8 @@ def load_and_split():
             .reset_index(drop=True))
     df, _ = prep.clean_labels(df, "full catalog", drop_saturated=True)
     df = df.reset_index(drop=True)
+    if MAX_LOGAGE_ERR is not None:
+        df = df[df[prep.TARGET_ERR] <= MAX_LOGAGE_ERR].reset_index(drop=True)
 
     rng = np.random.default_rng(SEED)
     strata = pd.qcut(df[prep.TARGET], q=10, labels=False, duplicates="drop")

@@ -161,6 +161,9 @@ def load_willett_merged(path, target_state="rgb", impostor_cut=True,
     out[ID_COL] = df[id_col].astype(str)
     snr = next((c for c in ("snr", "SNR", "snr_x", "raw_snr") if c in df.columns), None)
     out["SNR"] = df[snr] if snr else 1.0
+    # Mission provenance (Kepler/K2/TESS): never a model feature, but carried
+    # through so results can be diagnosed per mission downstream.
+    out["source"] = df["source"].values if "source" in df.columns else "unknown"
     out["TEFF"] = df["raw_teff"]
     out["TEFF_ERR"] = df[_first_col(df, ["raw_e_teff", "e_teff"], "Teff error")]
     out["LOGG"] = df["raw_logg"]
@@ -289,18 +292,29 @@ def apply_norm(df, features, stats):
     return df
 
 
-def add_sample_weights(df, n_bins, clip):
-    """Inverse-frequency weights per logAge bin -> flat effective age distribution."""
+def add_sample_weights(df, n_bins, clip, min_bin_count=5):
+    """Inverse-frequency weights per logAge bin -> flat effective age distribution.
+
+    ``min_bin_count`` floors the occupancy used for the inverse frequency: a bin
+    holding one or two (possibly mislabeled) stars must not hand them the weight
+    of a full bin -- on the all-missions sample that gave single dubious young
+    K2/TESS stars ~15x weight and destabilized training. The clip is enforced
+    AFTER the mean-1 normalization; the old order let normalization push the
+    max weight ~50% past the nominal clip.
+    """
     df = df.copy()
     lo, hi = df[TARGET].min(), df[TARGET].max()
     edges = np.linspace(lo, hi, n_bins + 1)
     idx = np.clip(np.digitize(df[TARGET].values, edges[1:-1]), 0, n_bins - 1)
     counts = np.bincount(idx, minlength=n_bins).astype(float)
     counts[counts == 0] = np.nan
-    inv = np.nanmean(counts) / counts          # ~1 for average bin, >1 for sparse bins
+    eff = np.maximum(counts, float(min_bin_count))
+    inv = np.nanmean(counts) / eff             # ~1 for average bin, >1 for sparse bins
     inv = np.clip(np.nan_to_num(inv, nan=clip), 1.0 / clip, clip)
     w = inv[idx]
-    df["train_weight"] = w / w.mean()          # normalize to mean 1
+    w = w / w.mean()                           # normalize to mean 1 ...
+    w = np.clip(w, 1.0 / clip, clip)           # ... and enforce the clip on the
+    df["train_weight"] = w                     # weights actually used
     return df, edges, counts
 
 
