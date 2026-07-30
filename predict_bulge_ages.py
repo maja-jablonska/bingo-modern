@@ -60,7 +60,7 @@ def load_model(bundle_path):
     return bundle, model, guide
 
 
-def predict_chunk(chunk, bundle, model, guide, num_samples, rng):
+def predict_chunk(chunk, bundle, model, guide, num_samples, rng, debias=False):
     feats = bundle["features"]
     chunk = prep.derive_features(chunk)
     chunk = prep.apply_norm(chunk, feats, bundle["stats"])
@@ -84,17 +84,34 @@ def predict_chunk(chunk, bundle, model, guide, num_samples, rng):
     # own model uncertainty and intrinsic scatter.
     total = rng.normal(pred, np.sqrt(model_unc ** 2 + intrinsic ** 2))
 
-    calib = bundle["calibration_factor"]
     med = np.median(total, axis=0)
     p16, p84 = np.percentile(total, [16, 84], axis=0)
 
     out = pd.DataFrame({c: chunk[c].values for c in CARRY_COLS if c in chunk})
-    out["logAge"] = med
-    # Calibrated: interval half-widths scaled around the median by the factor
-    # fit on the validation split.
-    out["logAgeErr"] = calib * total.std(axis=0)
-    out["logAge_16"] = med + calib * (p16 - med)
-    out["logAge_84"] = med + calib * (p84 - med)
+    # Extrapolation flag on the RAW median, as in the training notebook: a
+    # prediction outside the training logAge range left the region the data
+    # constrains -- broken, not merely uncertain.
+    lo, hi = bundle.get("train_label_range", (-np.inf, np.inf))
+    out["flag_outside_train_range"] = (med < lo) | (med > hi)
+
+    if debias:
+        # Bundle's affine de-shrinkage from the inverse calibration fit on
+        # val: pred' = a*pred + b, sigma' = raw_sigma * sigma_factor. Interval
+        # half-widths get the same sigma_factor, around the debiased median.
+        db = bundle["affine_debias"]
+        a, b, calib = db["a"], db["b"], db["sigma_factor"]
+        out["logAge"] = a * med + b
+        out["logAgeErr"] = calib * total.std(axis=0)
+        out["logAge_16"] = out["logAge"] + calib * (p16 - med)
+        out["logAge_84"] = out["logAge"] + calib * (p84 - med)
+    else:
+        calib = bundle["calibration_factor"]
+        out["logAge"] = med
+        # Calibrated: interval half-widths scaled around the median by the
+        # factor fit on the validation split.
+        out["logAgeErr"] = calib * total.std(axis=0)
+        out["logAge_16"] = med + calib * (p16 - med)
+        out["logAge_84"] = med + calib * (p84 - med)
     out["model_uncertainty"] = model_unc.mean(axis=0)
     out["age"] = 10.0 ** out["logAge"]                 # Gyr
     out["age_16"] = 10.0 ** out["logAge_16"]
@@ -112,6 +129,10 @@ def main():
                     help="output parquet (default: <input stem>_ages.parquet)")
     ap.add_argument("--num-samples", default=1000, type=int,
                     help="posterior samples per star (default 1000)")
+    ap.add_argument("--debias", action="store_true",
+                    help="apply the bundle's affine de-shrinkage "
+                         "(pred' = a*pred + b, sigma' = raw_sigma * "
+                         "sigma_factor) instead of the raw calibration")
     ap.add_argument("--batch-rows", default=20_000, type=int,
                     help="stars per chunk (default 20k)")
     ap.add_argument("--seed", default=42, type=int)
@@ -126,13 +147,17 @@ def main():
     set_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     bundle, model, guide = load_model(args.bundle)
+    if args.debias and "affine_debias" not in bundle:
+        sys.exit("--debias requested but the bundle has no 'affine_debias' "
+                 "(legacy bundle; retrain or drop the flag)")
 
     pf = pq.ParquetFile(in_path)
     writer, n_done = None, 0
     try:
         for batch in pf.iter_batches(batch_size=args.batch_rows):
             chunk = batch.to_pandas()
-            res = predict_chunk(chunk, bundle, model, guide, args.num_samples, rng)
+            res = predict_chunk(chunk, bundle, model, guide, args.num_samples,
+                                rng, debias=args.debias)
             table = pa.Table.from_pandas(res, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(out_path, table.schema)
