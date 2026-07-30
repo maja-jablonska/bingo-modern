@@ -8,11 +8,13 @@
 #
 # Submit from the repo root, once per state:
 #   qsub predict_bulge_ages.pbs                                        # RGB default
-#   qsub -v STATE=rc,BUNDLE=BNN_targeted_output_RC/bnn_inference_bundle_rc.pkl \
-#        predict_bulge_ages.pbs
+#   qsub -v STATE=rc predict_bulge_ages.pbs                            # red clump
+#   qsub -v DEBIAS=0 predict_bulge_ages.pbs        # raw calibration, no de-shrinkage
+#   qsub -v OUTPUT=/path/to/ages.parquet predict_bulge_ages.pbs
 #
-# The net is tiny (7 -> 32 hidden), so CPU is fine; for a many-million-star
-# catalog switch to one GPU:  -q gpuvolta -l ngpus=1 -l ncpus=12 -l mem=90GB
+# The net is tiny (8 features -> 32 hidden), so CPU is fine; for a
+# many-million-star catalog switch to one GPU:
+#   -q gpuvolta -l ngpus=1 -l ncpus=12 -l mem=90GB
 
 #PBS -P mk27
 #PBS -q normal
@@ -33,12 +35,21 @@ module load python3
 
 REPO="${REPO:-$HOME/scr_mk27/bingo-modern}"
 STATE="${STATE:-rgb}"
+STATE_UPPER=$(echo "$STATE" | tr '[:lower:]' '[:upper:]')
 INPUT="${INPUT:-$REPO/RGB_RC_classifier/bulge_${STATE}_bnn.parquet}"
-BUNDLE="${BUNDLE:-$REPO/BNN_targeted_output_RGB/bnn_inference_bundle_rgb.pkl}"
+BUNDLE="${BUNDLE:-$REPO/BNN_targeted_output_${STATE_UPPER}/bnn_inference_bundle_${STATE}.pkl}"
+# Default output goes next to the bulge data, not into the classifier dir.
+OUTPUT="${OUTPUT:-$HOME/scr_mk27/bulge-ages-and-orbits/data/bulge_${STATE}_bnn_ages.parquet}"
+# DEBIAS=1 (default) applies the bundle's affine de-shrinkage; DEBIAS=0 keeps
+# the raw calibrated output.
+DEBIAS="${DEBIAS:-1}"
+
+args=( --input "$INPUT"
+       --bundle "$BUNDLE"
+       --output "$OUTPUT"
+       --num-samples 1000
+       --batch-rows 20000 )
+[ "$DEBIAS" != "0" ] && args+=( --debias )
 
 cd "$REPO"
-python3 predict_bulge_ages.py \
-    --input "$INPUT" \
-    --bundle "$BUNDLE" \
-    --num-samples 1000 \
-    --batch-rows 20000
+python3 predict_bulge_ages.py "${args[@]}"
