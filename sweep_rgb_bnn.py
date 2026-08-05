@@ -31,12 +31,21 @@ import prepare_dataset as prep
 DATASET = os.environ.get("SWEEP_DATASET", os.path.expanduser(
     "~/scr_mk27/bulge-ages-and-orbits/data/merged_with_ages_raw.parquet"))
 # RGB selection persisted by the Cannon notebook (adds classifier-accepted
-# K2/TESS stars); falls back to seismic-only if the file is absent.
+# K2/TESS stars). Resolution of SWEEP_SELECTION_FILE:
+#   unset/empty -> the default file if it exists, else seismic-only
+#   "none"      -> FORCE seismic-only (Kepler EvoState==1), even if the
+#                  default file exists -- use this to sweep the Kepler sample
+#   a path      -> that file
 _DEFAULT_SELECTION = os.path.expanduser(
     "~/scr_mk27/bulge-ages-and-orbits/data/rgb_selection_all_missions.parquet")
-SELECTION_FILE = (os.environ.get("SWEEP_SELECTION_FILE")
-                  or (_DEFAULT_SELECTION if os.path.exists(_DEFAULT_SELECTION)
-                      else None))
+_sel_env = os.environ.get("SWEEP_SELECTION_FILE", "")
+if _sel_env.lower() == "none":
+    SELECTION_FILE = None
+elif _sel_env:
+    SELECTION_FILE = _sel_env
+else:
+    SELECTION_FILE = (_DEFAULT_SELECTION if os.path.exists(_DEFAULT_SELECTION)
+                      else None)
 SEED = 42
 TEST_FRAC = 0.20
 VAL_FRAC = 0.15
@@ -220,7 +229,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--index", type=int,
                     default=int(os.environ.get("PBS_ARRAY_INDEX", -1)))
-    ap.add_argument("--outdir", default="sweep_results")
+    ap.add_argument("--outdir",
+                    default=os.environ.get("SWEEP_OUTDIR", "sweep_results"))
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--collect", action="store_true")
     ap.add_argument("--smoke", action="store_true",
@@ -242,11 +252,15 @@ def main():
 
     cfg = GRID[args.index]
     print(f"Running config {args.index}: {cfg}")
+    print(f"Selection: {SELECTION_FILE or 'seismic-only (Kepler EvoState==1)'} | "
+          f"outdir: {args.outdir}")
     result, losses, val_hist = run_config(cfg, args.outdir, smoke=args.smoke)
     outdir = Path(args.outdir)
     outdir.mkdir(exist_ok=True)
     out = outdir / f"result_{args.index:03d}.json"
-    out.write_text(json.dumps({"index": args.index, **result}, indent=2))
+    out.write_text(json.dumps({"index": args.index,
+                               "selection_file": SELECTION_FILE,
+                               **result}, indent=2))
     print(f"Wrote {out}")
     print(json.dumps(result, indent=2))
     if not args.no_wandb:

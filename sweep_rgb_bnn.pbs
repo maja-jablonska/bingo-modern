@@ -12,6 +12,15 @@
 # To run only one config (e.g. a re-run of a failed one):
 #   qsub -v SWEEP_INDEX=7 sweep_rgb_bnn.pbs
 #
+# Sample selection (must match the notebook you plan to promote the winner to):
+#   qsub sweep_rgb_bnn.pbs
+#       -> all-missions sample (train_pipeline_rgb.ipynb): uses the persisted
+#          classifier selection when the file exists
+#   qsub -v SWEEP_SELECTION_FILE=none,SWEEP_OUTDIR=sweep_results_kepler sweep_rgb_bnn.pbs
+#       -> Kepler-only sample (train_pipeline_rgb_kepler.ipynb): forces seismic
+#          EvoState==1 and keeps results/wandb in a separate directory
+# Rank a specific sweep with:  python3 sweep_rgb_bnn.py --collect --outdir <dir>
+#
 # wandb: Gadi COMPUTE NODES HAVE NO INTERNET, so every run is logged in
 # offline mode into sweep_results/wandb/. After the sweep finishes, sync from
 # a LOGIN node (which does have internet; needs `wandb login` done once):
@@ -49,7 +58,7 @@ cd "$REPO"
 # and are synced later from a login node.
 export WANDB_MODE="${WANDB_MODE:-offline}"
 
-OUTDIR=sweep_results
+OUTDIR="${SWEEP_OUTDIR:-sweep_results}"
 mkdir -p "$OUTDIR"
 
 N_CONFIGS=$(python3 sweep_rgb_bnn.py --list | wc -l)
