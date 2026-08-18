@@ -35,7 +35,10 @@ else:
 import stardata  # noqa: E402
 import prepare_dataset as prep  # noqa: E402
 
-FEATURES = prep.BASE_FEATURES + ["C_N", "M_H"]
+# Same catalogue labels the spectral methods train on: the BNN cannot see
+# pixels, but it must not be denied information Cannon/Lux have, or the
+# comparison measures the feature list rather than the method.
+FEATURES = prep.BASE_FEATURES + ["C_N", "M_H", "LOGG_SEISMIC", "AL_FE"]
 
 
 def main():
@@ -44,7 +47,16 @@ def main():
     ap.add_argument("--outdir", default="BNN_shared_output")
     ap.add_argument("--hidden-dim", type=int, default=64)
     ap.add_argument("--initial-lr", type=float, default=0.0025)
-    ap.add_argument("--weight-clip", type=float, default=10.0)
+    ap.add_argument("--weight-clip", type=float, default=10.0,
+                    help="only used with --sample-weights inverse-frequency")
+    ap.add_argument("--sample-weights", default="none",
+                    choices=["none", "inverse-frequency"],
+                    help="'inverse-frequency' flattens the training age "
+                         "distribution. The Cannon and Lux train on the "
+                         "natural (old-heavy) prior, so flattening only the "
+                         "BNN gives it a different amount of shrinkage and "
+                         "shows up as star-by-star disagreement. Default "
+                         "'none' keeps all three priors identical.")
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--iterations", type=int, default=20000)
     ap.add_argument("--num-samples", type=int, default=1000)
@@ -67,14 +79,27 @@ def main():
               f"(should be 0): {report}")
     frame = prep.derive_features(frame)
 
+    # clean_labels only guards prep.BASE_FEATURES, so the labels added here
+    # to match the spectral methods would otherwise reach SVI unchecked
+    needed = [c for f in FEATURES for c in (f, f"{f}_ERR")]
+    missing = [c for c in needed
+               if c not in frame.columns
+               or not np.isfinite(frame[c].to_numpy(float)).all()]
+    if missing:
+        sys.exit(f"features absent or non-finite in the shared dataset: "
+                 f"{missing} — rebuild the dataset with --rebuild")
+
     parts = {s: frame[frame["split"] == s].reset_index(drop=True)
              for s in ("train", "val", "test")}
     print({k: len(v) for k, v in parts.items()})
 
     stats = prep.fit_norm_stats(parts["train"], FEATURES)
     parts = {k: prep.apply_norm(v, FEATURES, stats) for k, v in parts.items()}
-    parts["train"], edges, _ = prep.add_sample_weights(
-        parts["train"], prep.N_AGE_BINS, args.weight_clip)
+    if args.sample_weights == "inverse-frequency":
+        parts["train"], edges, _ = prep.add_sample_weights(
+            parts["train"], prep.N_AGE_BINS, args.weight_clip)
+    else:
+        parts["train"] = parts["train"].assign(train_weight=1.0)
 
     feat_cols = [f"{f}_NORM" for f in FEATURES]
     err_cols = [f"{f}_ERR_NORM" for f in FEATURES]
@@ -125,6 +150,8 @@ def main():
     summary = pd.DataFrame({
         "APOGEE_ID": test["APOGEE_ID"].values,
         "source": test.get("source"),
+        "split": "test",
+        "is_primary": True,
         "observational_uncertainty": yse_np,
         "model_uncertainty": model_unc_mean,
         "intrinsic_scatter": intrinsic_mean,
@@ -149,8 +176,9 @@ def main():
     run_info = {
         "dataset_dir": str(args.dataset_dir),
         "config": {k: getattr(args, k) for k in
-                   ("hidden_dim", "initial_lr", "weight_clip", "batch_size",
-                    "iterations", "seed", "smoke")},
+                   ("hidden_dim", "initial_lr", "weight_clip",
+                    "sample_weights", "batch_size", "iterations", "seed",
+                    "smoke")},
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
         "epochs_run": len(losses),
