@@ -62,6 +62,19 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--likelihood", default="normal",
+                    choices=["normal", "student_t"],
+                    help="the RGB age residuals are strongly leptokurtic "
+                         "(excess kurtosis ~17), so a Normal has to widen "
+                         "sigma to cover the tails and then over-covers the "
+                         "core (85% inside 1 sigma against a nominal 68%). "
+                         "'student_t' absorbs the tails in its shape. NOTE "
+                         "this also robustifies TRAINING: outlying stars are "
+                         "down-weighted, so the fit changes, not just the "
+                         "reported uncertainty.")
+    ap.add_argument("--student-t-df", type=float, default=None,
+                    help="pin the degrees of freedom; default learns it as a "
+                         "global latent (observed tails imply nu ~ 4)")
     ap.add_argument("--early-stopping", default="on", choices=["on", "off"],
                     help="'off' runs the full --iterations budget. Early "
                          "stopping fires around epoch 340-430 of a ~600-epoch "
@@ -145,6 +158,8 @@ def main():
         intrinsic_scatter_prior=args.intrinsic_prior[0],
         intrinsic_scatter_prior_logstd=args.intrinsic_prior[1],
         prior_scale=args.prior_scale,
+        likelihood=args.likelihood,
+        student_t_df=args.student_t_df,
     ).to(device)
 
     guide, losses = train_smooth_bnn(
@@ -165,8 +180,19 @@ def main():
     pred_median = np.median(samples, axis=0)
     model_unc_mean = np.mean(model_unc, axis=0)
     intrinsic_mean = float(np.mean(intrinsic))
+    # For the Normal this is the predictive sigma. For the Student-t it is
+    # the SCALE: the core width. The distribution's own standard deviation is
+    # scale * sqrt(nu/(nu-2)), reported alongside so the two are never
+    # confused -- a t scale compared against a Normal sigma is not like for
+    # like, which is exactly the mistake that made the Normal fit look twice
+    # as over-conservative as it was.
     total_unc = np.sqrt(model_unc_mean ** 2 + intrinsic_mean ** 2
                         + yse_np ** 2)
+    nu = getattr(model, "student_t_df_fitted_", args.student_t_df)
+    if args.likelihood == "student_t" and nu and nu > 2:
+        total_std_equiv = total_unc * np.sqrt(nu / (nu - 2.0))
+    else:
+        total_std_equiv = total_unc
     residual = ys_np - pred_median            # bingo's own sign convention
 
     test = parts["test"]
@@ -180,6 +206,7 @@ def main():
         "model_uncertainty": model_unc_mean,
         "intrinsic_scatter": intrinsic_mean,
         "total_predictive_uncertainty": total_unc,
+        "total_predictive_std": total_std_equiv,
         "pred_median": pred_median,
         "pred_mean_only": np.asarray(mean_pred).mean(axis=0)
         if np.ndim(mean_pred) > 1 else np.asarray(mean_pred),
@@ -202,8 +229,10 @@ def main():
         "config": {k: getattr(args, k) for k in
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
-                    "early_stopping", "batch_size", "iterations", "seed",
-                    "smoke")},
+                    "likelihood", "student_t_df", "early_stopping",
+                    "batch_size", "iterations", "seed", "smoke")},
+        "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
+                                and nu else None),
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
         "epochs_run": len(losses),
