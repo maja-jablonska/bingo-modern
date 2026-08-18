@@ -110,7 +110,8 @@ class BayesianNeuralNetwork(PyroModule):
                  use_leaky_relu: bool = False,  # Standard ReLU by default
                  y_mean: float = 0.0, y_std: float = 1.0,
                  intrinsic_scatter_prior: float = 0.1,
-                 intrinsic_scatter_prior_logstd: float = 0.3):
+                 intrinsic_scatter_prior_logstd: float = 0.3,
+                 prior_scale: float = 1.0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -127,6 +128,15 @@ class BayesianNeuralNetwork(PyroModule):
         # push scatter into the per-star variance network instead.
         self.intrinsic_scatter_prior = intrinsic_scatter_prior
         self.intrinsic_scatter_prior_logstd = intrinsic_scatter_prior_logstd
+        # Width of the N(0, s) prior on every network weight. With ~9k weights
+        # over a few thousand stars the model is heavily over-parameterised,
+        # so in directions the data do not constrain the posterior simply sits
+        # at this prior -- and if those directions move the output, the
+        # reported model (epistemic) uncertainty stays large. On the RGB
+        # benchmark model_uncertainty came out at 0.18 dex against an actual
+        # residual scatter of 0.118, i.e. the posterior is over-dispersed;
+        # tightening this is the first thing to try.
+        self.prior_scale = prior_scale
 
         # Device anchor buffer: moves with .to(device) so priors/samples can be
         # built on the correct device lazily (PyroSample weights are NOT moved
@@ -169,8 +179,7 @@ class BayesianNeuralNetwork(PyroModule):
 
     def _set_priors(self):
         """Set Bayesian priors"""
-        # Use larger prior scale like old model
-        prior_scale = 1.0  # Changed from 0.5
+        prior_scale = self.prior_scale
 
         # Mean network priors - hidden layers
         self.fc1_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.input_dim], 2)

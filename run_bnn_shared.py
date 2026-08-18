@@ -62,6 +62,12 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--prior-scale", type=float, default=1.0,
+                    help="width of the N(0,s) prior on every network weight. "
+                         "The reported model (epistemic) uncertainty came out "
+                         "at 0.18 dex against an actual residual scatter of "
+                         "0.118 on the RGB benchmark, i.e. over-dispersed; "
+                         "try 0.25-0.5.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--input-err-systematics", default="on",
                     choices=["on", "off"],
@@ -131,6 +137,7 @@ def main():
         use_leaky_relu=True, y_mean=float(yt.mean()), y_std=float(yt.std()),
         intrinsic_scatter_prior=args.intrinsic_prior[0],
         intrinsic_scatter_prior_logstd=args.intrinsic_prior[1],
+        prior_scale=args.prior_scale,
     ).to(device)
 
     guide, losses = train_smooth_bnn(
@@ -187,8 +194,8 @@ def main():
         "dataset_dir": str(args.dataset_dir),
         "config": {k: getattr(args, k) for k in
                    ("hidden_dim", "initial_lr", "weight_clip",
-                    "sample_weights", "input_err_systematics", "batch_size",
-                    "iterations", "seed", "smoke")},
+                    "sample_weights", "input_err_systematics", "prior_scale",
+                    "batch_size", "iterations", "seed", "smoke")},
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
         "epochs_run": len(losses),
