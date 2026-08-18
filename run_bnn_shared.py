@@ -63,6 +63,14 @@ def main():
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--input-err-systematics", default="on",
+                    choices=["on", "off"],
+                    help="add stardata.LABEL_SYST in quadrature to the input "
+                         "feature errors. The catalogue's quoted errors are "
+                         "formal precisions (median [Fe/H] error 0.001 dex), "
+                         "so with 'off' the BNN is told its inputs are "
+                         "essentially exact and the intrinsic_scatter term "
+                         "absorbs the unmodelled input noise.")
     ap.add_argument("--smoke", action="store_true",
                     help="tiny run for wiring checks")
     args = ap.parse_args()
@@ -72,7 +80,8 @@ def main():
                            get_targeted_posterior_samples, device)
 
     stars, manifest = stardata.load_stars(args.dataset_dir)
-    frame = stardata.to_bingo_frame(stars)
+    frame = stardata.to_bingo_frame(
+        stars, err_systematics=args.input_err_systematics == "on")
     frame, report = prep.clean_labels(frame, "shared", drop_saturated=True)
     if report.get("n_dropped", 0):
         print(f"warning: clean_labels dropped rows on a shared dataset "
@@ -178,8 +187,8 @@ def main():
         "dataset_dir": str(args.dataset_dir),
         "config": {k: getattr(args, k) for k in
                    ("hidden_dim", "initial_lr", "weight_clip",
-                    "sample_weights", "batch_size", "iterations", "seed",
-                    "smoke")},
+                    "sample_weights", "input_err_systematics", "batch_size",
+                    "iterations", "seed", "smoke")},
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
         "epochs_run": len(losses),
