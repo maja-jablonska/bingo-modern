@@ -148,6 +148,7 @@ def main():
 
     test = parts["test"]
     summary = pd.DataFrame({
+        "row_id": test["row_id"].values,
         "APOGEE_ID": test["APOGEE_ID"].values,
         "source": test.get("source"),
         "split": "test",
