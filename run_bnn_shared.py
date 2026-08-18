@@ -62,6 +62,13 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--early-stopping", default="on", choices=["on", "off"],
+                    help="'off' runs the full --iterations budget. Early "
+                         "stopping fires around epoch 340-430 of a ~600-epoch "
+                         "budget with the LR already decayed to ~13%, so the "
+                         "weight posterior may simply not have finished "
+                         "contracting -- which would show up as an inflated "
+                         "model_uncertainty and over-wide predictions.")
     ap.add_argument("--prior-scale", type=float, default=1.0,
                     help="width of the N(0,s) prior on every network weight. "
                          "The reported model (epistemic) uncertainty came out "
@@ -147,8 +154,8 @@ def main():
         batch_size=args.batch_size, seed=args.seed,
         w_train=wt, minibatch_scale=True,
         X_val=Xv, X_err_val=Xve, y_val=yv, y_err_val=yve,
-        early_stopping=not args.smoke, patience=8, eval_every=5,
-        restore_best=True)
+        early_stopping=(args.early_stopping == "on") and not args.smoke,
+        patience=8, eval_every=5, restore_best=True)
 
     n_samp = 100 if args.smoke else args.num_samples
     samples, mean_pred, model_unc, intrinsic = get_targeted_posterior_samples(
@@ -195,7 +202,8 @@ def main():
         "config": {k: getattr(args, k) for k in
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
-                    "batch_size", "iterations", "seed", "smoke")},
+                    "early_stopping", "batch_size", "iterations", "seed",
+                    "smoke")},
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
         "epochs_run": len(losses),
