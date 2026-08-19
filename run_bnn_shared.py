@@ -68,7 +68,7 @@ def main():
                          "currently spans only p90/p10 = 1.47, i.e. the model "
                          "is near-homoscedastic, which no tail shape can "
                          "calibrate; loosening this is the candidate fix.")
-    ap.add_argument("--likelihood", default="normal",
+    ap.add_argument("--likelihood", default="student_t",
                     choices=["normal", "student_t"],
                     help="the RGB age residuals are strongly leptokurtic "
                          "(excess kurtosis ~17), so a Normal has to widen "
@@ -81,6 +81,11 @@ def main():
     ap.add_argument("--student-t-df", type=float, default=None,
                     help="pin the degrees of freedom; default learns it as a "
                          "global latent (observed tails imply nu ~ 4)")
+    ap.add_argument("--mode", choices=["holdout", "oof"], default="holdout",
+                    help="'oof' additionally refits per fold over the "
+                         "non-test stars, so EVERY star gets an "
+                         "out-of-sample prediction rather than the 20% in "
+                         "the test split. Mirrors the other two runners.")
     ap.add_argument("--early-stopping", default="on", choices=["on", "off"],
                     help="'off' runs the full --iterations budget. Early "
                          "stopping fires around epoch 340-430 of a ~600-epoch "
@@ -88,7 +93,7 @@ def main():
                          "weight posterior may simply not have finished "
                          "contracting -- which would show up as an inflated "
                          "model_uncertainty and over-wide predictions.")
-    ap.add_argument("--prior-scale", type=float, default=1.0,
+    ap.add_argument("--prior-scale", type=float, default=0.5,
                     help="width of the N(0,s) prior on every network weight. "
                          "The reported model (epistemic) uncertainty came out "
                          "at 0.18 dex against an actual residual scatter of "
@@ -134,93 +139,125 @@ def main():
              for s in ("train", "val", "test")}
     print({k: len(v) for k, v in parts.items()})
 
-    stats = prep.fit_norm_stats(parts["train"], FEATURES)
-    parts = {k: prep.apply_norm(v, FEATURES, stats) for k, v in parts.items()}
-    if args.sample_weights == "inverse-frequency":
-        parts["train"], edges, _ = prep.add_sample_weights(
-            parts["train"], prep.N_AGE_BINS, args.weight_clip)
-    else:
-        parts["train"] = parts["train"].assign(train_weight=1.0)
-
     feat_cols = [f"{f}_NORM" for f in FEATURES]
     err_cols = [f"{f}_ERR_NORM" for f in FEATURES]
     t = lambda a: torch.as_tensor(np.asarray(a, dtype=np.float32),
                                   device=device)
 
-    def tensors(d):
-        return (t(d[feat_cols].values), t(d[err_cols].values),
-                t(d[prep.TARGET].values), t(d[prep.TARGET_ERR].values))
+    def fit_predict(train_df, val_df, pred_df, verbose=True):
+        """Train on train_df (early-stopping on val_df) and predict pred_df.
 
-    Xt, Xe, yt, ye = tensors(parts["train"])
-    Xv, Xve, yv, yve = tensors(parts["val"])
-    Xs, Xse, ys, yse = tensors(parts["test"])
-    wt = t(parts["train"]["train_weight"].values)
+        Normalisation stats are refit on train_df every time, so an OOF fold
+        never sees statistics derived from the stars it predicts.
+        """
+        stats = prep.fit_norm_stats(train_df, FEATURES)
+        tr, va, pr = (prep.apply_norm(d, FEATURES, stats)
+                      for d in (train_df, val_df, pred_df))
+        if args.sample_weights == "inverse-frequency":
+            tr, _, _ = prep.add_sample_weights(tr, prep.N_AGE_BINS,
+                                               args.weight_clip)
+        else:
+            tr = tr.assign(train_weight=1.0)
 
-    set_seed(args.seed)
-    model = BayesianNeuralNetwork(
-        input_dim=len(FEATURES), hidden_dim=args.hidden_dim,
-        use_skip_connections=True, use_empirical_output_bias=True,
-        use_leaky_relu=True, y_mean=float(yt.mean()), y_std=float(yt.std()),
-        intrinsic_scatter_prior=args.intrinsic_prior[0],
-        intrinsic_scatter_prior_logstd=args.intrinsic_prior[1],
-        prior_scale=args.prior_scale,
-        var_prior_scale=args.var_prior_scale,
-        likelihood=args.likelihood,
-        student_t_df=args.student_t_df,
-    ).to(device)
+        def tensors(d):
+            return (t(d[feat_cols].values), t(d[err_cols].values),
+                    t(d[prep.TARGET].values), t(d[prep.TARGET_ERR].values))
 
-    guide, losses = train_smooth_bnn(
-        model, Xt, Xe, yt, ye,
-        num_iterations=200 if args.smoke else args.iterations,
-        initial_lr=args.initial_lr, lr_decay_per_epoch=0.995,
-        batch_size=args.batch_size, seed=args.seed,
-        w_train=wt, minibatch_scale=True,
-        X_val=Xv, X_err_val=Xve, y_val=yv, y_err_val=yve,
-        early_stopping=(args.early_stopping == "on") and not args.smoke,
-        patience=8, eval_every=5, restore_best=True)
+        Xt, Xe, yt, ye = tensors(tr)
+        Xv, Xve, yv, yve = tensors(va)
+        Xs, Xse, ys, yse = tensors(pr)
+        wt = t(tr["train_weight"].values)
 
-    n_samp = 100 if args.smoke else args.num_samples
-    samples, mean_pred, model_unc, intrinsic = get_targeted_posterior_samples(
-        model, guide, Xs, Xse, yse, num_samples=n_samp)
+        set_seed(args.seed)
+        model = BayesianNeuralNetwork(
+            input_dim=len(FEATURES), hidden_dim=args.hidden_dim,
+            use_skip_connections=True, use_empirical_output_bias=True,
+            use_leaky_relu=True, y_mean=float(yt.mean()),
+            y_std=float(yt.std()),
+            intrinsic_scatter_prior=args.intrinsic_prior[0],
+            intrinsic_scatter_prior_logstd=args.intrinsic_prior[1],
+            prior_scale=args.prior_scale,
+            var_prior_scale=args.var_prior_scale,
+            likelihood=args.likelihood,
+            student_t_df=args.student_t_df,
+        ).to(device)
 
-    ys_np, yse_np = ys.cpu().numpy(), yse.cpu().numpy()
-    pred_median = np.median(samples, axis=0)
-    model_unc_mean = np.mean(model_unc, axis=0)
-    intrinsic_mean = float(np.mean(intrinsic))
-    # For the Normal this is the predictive sigma. For the Student-t it is
-    # the SCALE: the core width. The distribution's own standard deviation is
-    # scale * sqrt(nu/(nu-2)), reported alongside so the two are never
-    # confused -- a t scale compared against a Normal sigma is not like for
-    # like, which is exactly the mistake that made the Normal fit look twice
-    # as over-conservative as it was.
-    total_unc = np.sqrt(model_unc_mean ** 2 + intrinsic_mean ** 2
-                        + yse_np ** 2)
-    nu = getattr(model, "student_t_df_fitted_", args.student_t_df)
-    if args.likelihood == "student_t" and nu and nu > 2:
-        total_std_equiv = total_unc * np.sqrt(nu / (nu - 2.0))
-    else:
-        total_std_equiv = total_unc
-    residual = ys_np - pred_median            # bingo's own sign convention
+        guide, losses = train_smooth_bnn(
+            model, Xt, Xe, yt, ye,
+            num_iterations=200 if args.smoke else args.iterations,
+            initial_lr=args.initial_lr, lr_decay_per_epoch=0.995,
+            batch_size=args.batch_size, seed=args.seed,
+            w_train=wt, minibatch_scale=True,
+            X_val=Xv, X_err_val=Xve, y_val=yv, y_err_val=yve,
+            early_stopping=(args.early_stopping == "on") and not args.smoke,
+            patience=8, eval_every=5, restore_best=True)
 
-    test = parts["test"]
-    summary = pd.DataFrame({
-        "row_id": test["row_id"].values,
-        "APOGEE_ID": test["APOGEE_ID"].values,
-        "source": test.get("source"),
-        "split": "test",
-        "is_primary": True,
-        "observational_uncertainty": yse_np,
-        "model_uncertainty": model_unc_mean,
-        "intrinsic_scatter": intrinsic_mean,
-        "total_predictive_uncertainty": total_unc,
-        "total_predictive_std": total_std_equiv,
-        "pred_median": pred_median,
-        "pred_mean_only": np.asarray(mean_pred).mean(axis=0)
-        if np.ndim(mean_pred) > 1 else np.asarray(mean_pred),
-        "true_age": ys_np,
-        "residual": residual,
-        "normalized_residual": residual / total_unc,
-    })
+        n_samp = 100 if args.smoke else args.num_samples
+        samples, mean_pred, model_unc, intrinsic = \
+            get_targeted_posterior_samples(model, guide, Xs, Xse, yse,
+                                           num_samples=n_samp)
+        ys_np, yse_np = ys.cpu().numpy(), yse.cpu().numpy()
+        pred_median = np.median(samples, axis=0)
+        model_unc_mean = np.mean(model_unc, axis=0)
+        intrinsic_mean = float(np.mean(intrinsic))
+        # For the Normal this is the predictive sigma. For the Student-t it
+        # is the SCALE: the core width. The distribution's own standard
+        # deviation is scale * sqrt(nu/(nu-2)), reported alongside so the
+        # two are never confused -- a t scale compared against a Normal
+        # sigma is not like for like, which is exactly the mistake that made
+        # the Normal fit look twice as over-conservative as it was.
+        total_unc = np.sqrt(model_unc_mean ** 2 + intrinsic_mean ** 2
+                            + yse_np ** 2)
+        nu = getattr(model, "student_t_df_fitted_", args.student_t_df)
+        if args.likelihood == "student_t" and nu and nu > 2:
+            total_std_equiv = total_unc * np.sqrt(nu / (nu - 2.0))
+        else:
+            total_std_equiv = total_unc
+        residual = ys_np - pred_median        # bingo's own sign convention
+        out = pd.DataFrame({
+            "row_id": pred_df["row_id"].values,
+            "APOGEE_ID": pred_df["APOGEE_ID"].values,
+            "source": pred_df.get("source"),
+            "split": pred_df["split"].values,
+            "is_primary": True,
+            "observational_uncertainty": yse_np,
+            "model_uncertainty": model_unc_mean,
+            "intrinsic_scatter": intrinsic_mean,
+            "total_predictive_uncertainty": total_unc,
+            "total_predictive_std": total_std_equiv,
+            "pred_median": pred_median,
+            "pred_mean_only": np.asarray(mean_pred).mean(axis=0)
+            if np.ndim(mean_pred) > 1 else np.asarray(mean_pred),
+            "true_age": ys_np,
+            "residual": residual,
+            "normalized_residual": residual / total_unc,
+        })
+        return out, len(losses), intrinsic_mean, nu
+
+    summary, epochs_run, intrinsic_mean, nu = fit_predict(
+        parts["train"], parts["val"], parts["test"])
+
+    if args.mode == "oof":
+        # Every non-test star also gets a prediction from a model that never
+        # saw it: fold k is predicted, fold (k+1) serves as its early-stopping
+        # validation set, the remaining folds train. Test rows keep the
+        # holdout predictions above.
+        nontest = frame[frame["split"] != "test"].reset_index(drop=True)
+        folds = sorted({int(f) for f in nontest["fold"] if f >= 0})
+        extra = []
+        for i, k in enumerate(folds):
+            vk = folds[(i + 1) % len(folds)]
+            pr = nontest[nontest.fold == k]
+            va = nontest[nontest.fold == vk]
+            tr = nontest[~nontest.fold.isin([k, vk])]
+            if not len(pr) or not len(va) or not len(tr):
+                continue
+            print(f"\nOOF fold {k}: train {len(tr)}, val {len(va)}, "
+                  f"predict {len(pr)}")
+            o, _, _, _ = fit_predict(tr, va, pr)
+            extra.append(o)
+        if extra:
+            summary = pd.concat([summary] + extra, ignore_index=True)
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -229,6 +266,10 @@ def main():
     import pyro
     pyro.get_param_store().save(str(outdir / "targeted_bnn_params.pth"))
 
+    # test rows only: with --mode oof the summary also holds fold
+    # predictions, which must not enter the held-out test metrics
+    tst = summary[summary["split"] == "test"]
+    residual = tst["residual"].to_numpy(float)
     bias = float(np.median(residual))
     sig = float(1.4826 * np.median(np.abs(residual - np.median(residual))))
     run_info = {
@@ -237,13 +278,14 @@ def main():
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
                     "var_prior_scale", "likelihood", "student_t_df",
-                    "early_stopping",
+                    "early_stopping", "mode",
                     "batch_size", "iterations", "seed", "smoke")},
         "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
                                 and nu else None),
         "features": FEATURES,
         "n": {k: int(len(v)) for k, v in parts.items()},
-        "epochs_run": len(losses),
+        "n_predicted": int(len(summary)),
+        "epochs_run": epochs_run,
         "test_bias": bias, "test_scatter": sig,
         "test_rms": float(np.sqrt(np.mean(residual ** 2))),
         "mean_intrinsic_scatter": intrinsic_mean,
