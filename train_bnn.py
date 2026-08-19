@@ -110,7 +110,11 @@ class BayesianNeuralNetwork(PyroModule):
                  use_leaky_relu: bool = False,  # Standard ReLU by default
                  y_mean: float = 0.0, y_std: float = 1.0,
                  intrinsic_scatter_prior: float = 0.1,
-                 intrinsic_scatter_prior_logstd: float = 0.3):
+                 intrinsic_scatter_prior_logstd: float = 0.3,
+                 prior_scale: float = 1.0,
+                 var_prior_scale: float = None,
+                 likelihood: str = "normal",
+                 student_t_df: float = None):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -127,6 +131,49 @@ class BayesianNeuralNetwork(PyroModule):
         # push scatter into the per-star variance network instead.
         self.intrinsic_scatter_prior = intrinsic_scatter_prior
         self.intrinsic_scatter_prior_logstd = intrinsic_scatter_prior_logstd
+        # Width of the N(0, s) prior on every network weight. With ~9k weights
+        # over a few thousand stars the model is heavily over-parameterised,
+        # so in directions the data do not constrain the posterior simply sits
+        # at this prior -- and if those directions move the output, the
+        # reported model (epistemic) uncertainty stays large. On the RGB
+        # benchmark model_uncertainty came out at 0.18 dex against an actual
+        # residual scatter of 0.118, i.e. the posterior is over-dispersed;
+        # tightening this is the first thing to try.
+        self.prior_scale = prior_scale
+        # Prior width for the VARIANCE network's weights. Historically hard
+        # wired to prior_scale * 0.3, which leaves it heavily regularised --
+        # at prior_scale 0.5 that is N(0, 0.15). An over-regularised variance
+        # head sits near its prior and emits a nearly constant sigma, and the
+        # measured behaviour matches: on the RGB benchmark the per-star sigma
+        # spans only p90/p10 = 1.47 while rho(sigma, |residual|) is +0.19 --
+        # it orders stars correctly but with badly compressed range. A nearly
+        # homoscedastic model cannot be calibrated on a sample with genuinely
+        # good and genuinely bad stars: one sigma must over-cover the good
+        # ones and under-cover the bad ones at the same time.
+        # None keeps the historical prior_scale * 0.3.
+        self.var_prior_scale = (prior_scale * 0.3 if var_prior_scale is None
+                                else var_prior_scale)
+
+        # Likelihood family. The RGB residuals are strongly leptokurtic
+        # (excess kurtosis ~17, RMS/robust ~1.35), and a Normal likelihood
+        # has to inflate sigma to cover the tails, which then over-covers the
+        # core: 85% of stars fall inside 1 sigma against a nominal 68%, while
+        # 2- and 3-sigma coverage is already about right. A Student-t absorbs
+        # the tails in its shape instead of its width.
+        #
+        # NOTE this is a robustification, not just a change of report: the t
+        # down-weights outlying stars during TRAINING, so the fit itself
+        # changes. Usually desirable (those stars are bad ASPCAP parameters,
+        # misclassified evolutionary states or spurious seismic detections)
+        # but it is a modelling decision, not a cosmetic one.
+        #
+        # ``student_t_df=None`` learns the degrees of freedom as a global
+        # latent; a float pins it. Excess kurtosis 6/(nu-4) puts the observed
+        # tails near nu ~ 4.
+        if likelihood not in ("normal", "student_t"):
+            raise ValueError(f"unknown likelihood {likelihood!r}")
+        self.likelihood = likelihood
+        self.student_t_df = student_t_df
 
         # Device anchor buffer: moves with .to(device) so priors/samples can be
         # built on the correct device lazily (PyroSample weights are NOT moved
@@ -169,8 +216,7 @@ class BayesianNeuralNetwork(PyroModule):
 
     def _set_priors(self):
         """Set Bayesian priors"""
-        # Use larger prior scale like old model
-        prior_scale = 1.0  # Changed from 0.5
+        prior_scale = self.prior_scale
 
         # Mean network priors - hidden layers
         self.fc1_mean.weight = self._normal_prior(0., prior_scale, [self.hidden_dim, self.input_dim], 2)
@@ -196,8 +242,8 @@ class BayesianNeuralNetwork(PyroModule):
             # Standard prior like old model - better for extrapolation
             self.fc_out_mean.bias = self._normal_prior(0., prior_scale, [1], 1)
 
-        # Variance network priors
-        var_prior_scale = prior_scale * 0.3  # Adjusted
+        # Variance network priors (see __init__ for why this is separable)
+        var_prior_scale = self.var_prior_scale
         self.fc1_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2, self.input_dim], 2)
         self.fc1_var.bias = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2], 1)
         self.fc2_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//4, self.hidden_dim//2], 2)
@@ -289,6 +335,23 @@ class BayesianNeuralNetwork(PyroModule):
         model_std = pyro.deterministic("model_uncertainty", torch.sqrt(model_var))
         intrinsic_std = pyro.deterministic("intrinsic_scatter", torch.sqrt(intrinsic_var))
 
+        # Degrees of freedom for the Student-t likelihood. Sampled as
+        # log(nu - 2) so nu > 2 and the variance stays finite.
+        if self.likelihood == "student_t":
+            if self.student_t_df is None:
+                log_df_m2 = pyro.sample(
+                    "log_df_minus2",
+                    dist.Normal(
+                        torch.as_tensor(np.log(2.0), dtype=anchor.dtype,
+                                        device=anchor.device),
+                        torch.as_tensor(0.75, dtype=anchor.dtype,
+                                        device=anchor.device)))
+                df = 2.0 + torch.exp(log_df_m2)
+            else:
+                df = torch.as_tensor(float(self.student_t_df),
+                                     dtype=anchor.dtype, device=anchor.device)
+            df = pyro.deterministic("student_t_df", df)
+
         # Likelihood
         if y is not None and y_err is not None:
             observational_var = y_err ** 2
@@ -297,6 +360,13 @@ class BayesianNeuralNetwork(PyroModule):
             total_var = observational_var + model_var + intrinsic_var_expanded
             total_std = torch.sqrt(total_var)
             total_std = torch.clamp(total_std, min=1e-6)
+            if self.likelihood == "student_t":
+                # total_std is the SCALE, so the variance components keep
+                # their meaning as the core width; the t's own variance is
+                # scale^2 * nu/(nu-2), reported separately by the runner.
+                obs_dist = dist.StudentT(df, mu, total_std)
+            else:
+                obs_dist = dist.Normal(mu, total_std)
 
             with pyro.plate("data", y.shape[0]):
                 if w is not None:
@@ -304,9 +374,9 @@ class BayesianNeuralNetwork(PyroModule):
                     # and/or minibatch ELBO correction). Scales each star's
                     # log-likelihood without touching the global-weight KL term.
                     with pyro.poutine.scale(scale=w):
-                        pyro.sample("obs", dist.Normal(mu, total_std), obs=y)
+                        pyro.sample("obs", obs_dist, obs=y)
                 else:
-                    pyro.sample("obs", dist.Normal(mu, total_std), obs=y)
+                    pyro.sample("obs", obs_dist, obs=y)
 
         return mu, model_var, intrinsic_var
 
@@ -429,8 +499,12 @@ def get_targeted_posterior_samples(model: BayesianNeuralNetwork,
     print(f"\nGenerating {num_samples} posterior samples from targeted model...")
 
     # Create predictive distribution
+    sites = ["prediction", "model_uncertainty", "intrinsic_scatter"]
+    student_t = getattr(model, "likelihood", "normal") == "student_t"
+    if student_t:
+        sites.append("student_t_df")
     predictive = Predictive(model, guide=guide, num_samples=num_samples,
-                           return_sites=["prediction", "model_uncertainty", "intrinsic_scatter"])
+                           return_sites=sites)
 
     with torch.no_grad():
         # Put model in eval mode to disable input noise
@@ -441,6 +515,8 @@ def get_targeted_posterior_samples(model: BayesianNeuralNetwork,
         predictions = samples["prediction"].cpu().numpy()  # (num_samples, n_stars)
         model_uncertainty = samples["model_uncertainty"].cpu().numpy()  # (num_samples, n_stars)
         intrinsic_scatter = samples["intrinsic_scatter"].cpu().numpy()  # (num_samples,)
+        df_samples = (samples["student_t_df"].cpu().numpy().reshape(-1)
+                      if student_t else None)
 
     # Calculate total predictive uncertainty
     y_err_np = y_err.cpu().numpy()  # (n_stars,)
@@ -456,14 +532,27 @@ def get_targeted_posterior_samples(model: BayesianNeuralNetwork,
         model_unc_i = model_uncertainty[i, :]  # Model uncertainty for this sample
         intrinsic_i = intrinsic_scatter[i]  # Intrinsic scatter for this sample
 
-        # Sample from the total distribution for each star
-        for j in range(n_stars):
-            total_var = y_err_np[j]**2 + model_unc_i[j]**2 + intrinsic_i**2
-            total_std = np.sqrt(total_var)
+        # The predictive draw MUST use the same family as the likelihood,
+        # or the reported samples do not describe the fitted model.
+        total_scale = np.sqrt(y_err_np**2 + model_unc_i**2 + intrinsic_i**2)
+        if student_t:
+            nu = float(np.ravel(df_samples[i])[0])
+            total_samples[i, :] = (pred_i
+                                   + np.random.standard_t(nu, n_stars)
+                                   * total_scale)
+        else:
+            total_samples[i, :] = np.random.normal(pred_i, total_scale)
 
-            # Sample from Normal(prediction, total_uncertainty)
-            total_samples[i, j] = np.random.normal(pred_i[j], total_std)
-
+    if student_t:
+        nu_mean = float(np.mean(df_samples))
+        model.student_t_df_fitted_ = nu_mean
+        var_infl = np.sqrt(nu_mean / (nu_mean - 2.0)) if nu_mean > 2 else np.inf
+        # excess kurtosis is 6/(nu-4) only for nu comfortably above 4; it
+        # diverges at 4 and is undefined below, so do not print a number there
+        kurt = (f", excess kurtosis {6.0/(nu_mean-4.0):.2f}"
+                if nu_mean > 4.5 else ", tails heavier than any finite kurtosis"
+                if nu_mean <= 4.0 else "")
+        print(f"Student-t df: {nu_mean:.2f} (std = scale x {var_infl:.3f}{kurt})")
     print(f"Mean intrinsic scatter: {np.mean(intrinsic_scatter):.4f} ± {np.std(intrinsic_scatter):.4f} dex")
     print(f"Mean model uncertainty: {np.mean(model_uncertainty):.4f} dex")
     print(f"Mean observational uncertainty: {np.mean(y_err_np):.4f} dex")
