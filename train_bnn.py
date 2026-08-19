@@ -112,6 +112,7 @@ class BayesianNeuralNetwork(PyroModule):
                  intrinsic_scatter_prior: float = 0.1,
                  intrinsic_scatter_prior_logstd: float = 0.3,
                  prior_scale: float = 1.0,
+                 var_prior_scale: float = None,
                  likelihood: str = "normal",
                  student_t_df: float = None):
         super().__init__()
@@ -139,6 +140,19 @@ class BayesianNeuralNetwork(PyroModule):
         # residual scatter of 0.118, i.e. the posterior is over-dispersed;
         # tightening this is the first thing to try.
         self.prior_scale = prior_scale
+        # Prior width for the VARIANCE network's weights. Historically hard
+        # wired to prior_scale * 0.3, which leaves it heavily regularised --
+        # at prior_scale 0.5 that is N(0, 0.15). An over-regularised variance
+        # head sits near its prior and emits a nearly constant sigma, and the
+        # measured behaviour matches: on the RGB benchmark the per-star sigma
+        # spans only p90/p10 = 1.47 while rho(sigma, |residual|) is +0.19 --
+        # it orders stars correctly but with badly compressed range. A nearly
+        # homoscedastic model cannot be calibrated on a sample with genuinely
+        # good and genuinely bad stars: one sigma must over-cover the good
+        # ones and under-cover the bad ones at the same time.
+        # None keeps the historical prior_scale * 0.3.
+        self.var_prior_scale = (prior_scale * 0.3 if var_prior_scale is None
+                                else var_prior_scale)
 
         # Likelihood family. The RGB residuals are strongly leptokurtic
         # (excess kurtosis ~17, RMS/robust ~1.35), and a Normal likelihood
@@ -228,8 +242,8 @@ class BayesianNeuralNetwork(PyroModule):
             # Standard prior like old model - better for extrapolation
             self.fc_out_mean.bias = self._normal_prior(0., prior_scale, [1], 1)
 
-        # Variance network priors
-        var_prior_scale = prior_scale * 0.3  # Adjusted
+        # Variance network priors (see __init__ for why this is separable)
+        var_prior_scale = self.var_prior_scale
         self.fc1_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2, self.input_dim], 2)
         self.fc1_var.bias = self._normal_prior(0., var_prior_scale, [self.hidden_dim//2], 1)
         self.fc2_var.weight = self._normal_prior(0., var_prior_scale, [self.hidden_dim//4, self.hidden_dim//2], 2)

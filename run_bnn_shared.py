@@ -62,6 +62,12 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--var-prior-scale", type=float, default=None,
+                    help="prior width for the VARIANCE network's weights "
+                         "(default: prior-scale * 0.3). The per-star sigma "
+                         "currently spans only p90/p10 = 1.47, i.e. the model "
+                         "is near-homoscedastic, which no tail shape can "
+                         "calibrate; loosening this is the candidate fix.")
     ap.add_argument("--likelihood", default="normal",
                     choices=["normal", "student_t"],
                     help="the RGB age residuals are strongly leptokurtic "
@@ -158,6 +164,7 @@ def main():
         intrinsic_scatter_prior=args.intrinsic_prior[0],
         intrinsic_scatter_prior_logstd=args.intrinsic_prior[1],
         prior_scale=args.prior_scale,
+        var_prior_scale=args.var_prior_scale,
         likelihood=args.likelihood,
         student_t_df=args.student_t_df,
     ).to(device)
@@ -229,7 +236,8 @@ def main():
         "config": {k: getattr(args, k) for k in
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
-                    "likelihood", "student_t_df", "early_stopping",
+                    "var_prior_scale", "likelihood", "student_t_df",
+                    "early_stopping",
                     "batch_size", "iterations", "seed", "smoke")},
         "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
                                 and nu else None),
