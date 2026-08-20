@@ -62,6 +62,13 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--err-inflation", type=float, default=1.0,
+                    help="scale the assumed input sigma_x. LatentNN's "
+                         "correction strength is set by sigma_x, and "
+                         "over-stating it over-corrects (Ting 2026 sec 7.4). "
+                         "The abundance systematics are upper bounds, so "
+                         "values below 1 test whether the observed slope of "
+                         "~1.04 is over-correction from an inflated sigma_x.")
     ap.add_argument("--latent-inputs", default="off", choices=["on", "off"],
                     help="LatentNN (Ting 2026, arXiv:2512.23138): optimise a "
                          "latent true value per input alongside the weights, "
@@ -129,7 +136,8 @@ def main():
 
     stars, manifest = stardata.load_stars(args.dataset_dir)
     frame = stardata.to_bingo_frame(
-        stars, err_systematics=args.input_err_systematics == "on")
+        stars, err_systematics=args.input_err_systematics == "on",
+        err_inflation=args.err_inflation)
     frame, report = prep.clean_labels(frame, "shared", drop_saturated=True)
     if report.get("n_dropped", 0):
         print(f"warning: clean_labels dropped rows on a shared dataset "
@@ -290,7 +298,7 @@ def main():
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
                     "var_prior_scale", "likelihood", "student_t_df",
-                    "latent_inputs", "early_stopping", "mode",
+                    "latent_inputs", "err_inflation", "early_stopping", "mode",
                     "batch_size", "iterations", "seed", "smoke")},
         "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
                                 and nu else None),
