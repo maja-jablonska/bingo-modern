@@ -62,6 +62,17 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--latent-inputs", default="off", choices=["on", "off"],
+                    help="LatentNN (Ting 2026, arXiv:2512.23138): optimise a "
+                         "latent true value per input alongside the weights, "
+                         "instead of feeding the network the noisy "
+                         "observations. Corrects attenuation bias, which "
+                         "compresses the predicted range by "
+                         "1/(1+(sigma_x/sigma_range)^2). On this sample the "
+                         "age-carrying features [C/N] and [Al/Fe] sit at "
+                         "SNR_x ~ 2.35, so the predicted attenuation (~0.85) "
+                         "is about the size of the BNN's measured residual "
+                         "shrinkage (0.91).")
     ap.add_argument("--var-prior-scale", type=float, default=None,
                     help="prior width for the VARIANCE network's weights "
                          "(default: prior-scale * 0.3). The per-star sigma "
@@ -180,6 +191,7 @@ def main():
             var_prior_scale=args.var_prior_scale,
             likelihood=args.likelihood,
             student_t_df=args.student_t_df,
+            latent_inputs=args.latent_inputs == "on",
         ).to(device)
 
         guide, losses = train_smooth_bnn(
@@ -278,7 +290,7 @@ def main():
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
                     "var_prior_scale", "likelihood", "student_t_df",
-                    "early_stopping", "mode",
+                    "latent_inputs", "early_stopping", "mode",
                     "batch_size", "iterations", "seed", "smoke")},
         "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
                                 and nu else None),

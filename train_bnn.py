@@ -114,7 +114,8 @@ class BayesianNeuralNetwork(PyroModule):
                  prior_scale: float = 1.0,
                  var_prior_scale: float = None,
                  likelihood: str = "normal",
-                 student_t_df: float = None):
+                 student_t_df: float = None,
+                 latent_inputs: bool = False):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -174,6 +175,24 @@ class BayesianNeuralNetwork(PyroModule):
             raise ValueError(f"unknown likelihood {likelihood!r}")
         self.likelihood = likelihood
         self.student_t_df = student_t_df
+
+        # LatentNN (Ting 2026, arXiv:2512.23138): treat the true inputs as
+        # latent variables optimised alongside the weights, rather than
+        # feeding the network the noisy observations.
+        #
+        # This corrects ATTENUATION BIAS, which arises from errors in the
+        # INPUTS and compresses the predicted dynamic range by
+        # lambda = 1/(1 + (sigma_x/sigma_range)^2). On the RGB sample the two
+        # age-carrying features sit at SNR_x ~ 2.35 ([C/N] and [Al/Fe]),
+        # giving lambda ~ 0.85 -- the same size as the BNN's measured
+        # residual shrinkage of 0.91.
+        #
+        # Note the previous behaviour (resampling x ~ N(x_obs, sigma_x) each
+        # step) does NOT fix this, despite what the forward() docstring used
+        # to claim: every draw still has expectation x_obs, so the model is
+        # still fitting conditioned on noisy inputs and lambda is unchanged.
+        # See section 7.3 of the paper.
+        self.latent_inputs = latent_inputs
 
         # Device anchor buffer: moves with .to(device) so priors/samples can be
         # built on the correct device lazily (PyroSample weights are NOT moved
@@ -252,7 +271,7 @@ class BayesianNeuralNetwork(PyroModule):
         log_var_mean = np.log(self.y_std**2 * 0.1)
         self.fc3_var.bias = self._normal_prior(log_var_mean, 0.5, [1], 1)
 
-    def forward(self, x, x_err=None, y=None, y_err=None, w=None):
+    def forward(self, x, x_err=None, y=None, y_err=None, w=None, idx=None):
         """Forward pass with proper input uncertainty modeling
 
         ``w`` is an optional per-star likelihood weight (shape ``(batch,)``). It
@@ -261,29 +280,29 @@ class BayesianNeuralNetwork(PyroModule):
         (multiply by ``N_total / batch_size``) so the data term is not
         over-regularized by the once-per-step KL. ``w=None`` => unweighted.
 
-        We model the true (noise-free) inputs as latent variables:
-        x_true ~ Normal(x_observed, x_err)
+        With ``latent_inputs`` the true inputs are free parameters tied to
+        the observations by a Gaussian latent likelihood -- the LatentNN
+        correction for attenuation bias. Without it the observed values are
+        used directly; the old behaviour of resampling x ~ N(x_obs, x_err)
+        each step is gone, because it does not remove the bias (every draw
+        still has expectation x_obs) and only adds gradient noise.
 
-        This is a proper hierarchical model that avoids the bias issues
-        of simply adding noise during training.
+        Predictions always use the OBSERVED inputs: the correction lives in
+        the learned function, not in per-star denoising.
         """
-
-        # Handle input uncertainty using vectorized sampling without plates
-        if x_err is not None and torch.sum(x_err) > 0:
-            # Clamp uncertainties to avoid numerical issues
-            x_err_clamped = torch.clamp(x_err, min=1e-6, max=1.0)
-
-            # During training, add input uncertainty using reparameterization trick
-            if self.training:
-                # Use reparameterization trick to sample x_true
-                # This avoids the plate/batch size issues while still modeling uncertainty
-                eps = torch.randn_like(x)
-                x_true = x + eps * x_err_clamped
-            else:
-                # During inference, use the observed values (MAP estimate)
-                x_true = x
+        x_err_clamped = (torch.clamp(x_err, min=1e-6, max=1.0)
+                         if x_err is not None else None)
+        if (self.latent_inputs and self.training and idx is not None
+                and x_err_clamped is not None):
+            xl = pyro.param("x_latent")[idx]
+            with pyro.plate("latent_plate", x.shape[0]):
+                if w is not None:
+                    with pyro.poutine.scale(scale=w):
+                        pyro.sample("x_obs", dist.Normal(xl, x_err_clamped).to_event(1), obs=x)
+                else:
+                    pyro.sample("x_obs", dist.Normal(xl, x_err_clamped).to_event(1), obs=x)
+            x_true = xl
         else:
-            # No input errors provided, use observed values directly
             x_true = x
 
         # Choose activation function
@@ -721,8 +740,20 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
     # can rebalance the age distribution; default to ones = unweighted).
     if w_train is None:
         w_train = torch.ones_like(y_train)
-    dataset = torch.utils.data.TensorDataset(X_train, X_err_train, y_train, y_err_train, w_train)
+    # row index rides along so each star can be matched to its latent input
+    idx_all = torch.arange(X_train.shape[0], device=X_train.device)
+    dataset = torch.utils.data.TensorDataset(X_train, X_err_train, y_train,
+                                             y_err_train, w_train, idx_all)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # LatentNN: one free latent per training star per feature, initialised at
+    # the observation. Created before SVI so the optimiser picks it up; it is
+    # a point estimate (the MAP limit of the hierarchical model), not a guided
+    # sample site, so the AutoNormal guide leaves it alone.
+    if getattr(model, "latent_inputs", False):
+        pyro.param("x_latent", X_train.detach().clone())
+        print(f"LatentNN: {X_train.shape[0]} x {X_train.shape[1]} latent "
+              f"inputs ({X_train.numel():,} extra parameters)")
 
     # Setup SVI with improved optimizer settings
     guide = AutoDiagonalNormal(model)
@@ -792,10 +823,11 @@ def train_smooth_bnn(model: BayesianNeuralNetwork,
         epoch_loss = 0.0
         batch_losses = []
 
-        for batch_x, batch_x_err, batch_y, batch_y_err, batch_w in loader:
+        for batch_x, batch_x_err, batch_y, batch_y_err, batch_w, batch_i in loader:
             if minibatch_scale:
                 batch_w = batch_w * (len(X_train) / len(batch_x))
-            loss = svi.step(batch_x, batch_x_err, batch_y, batch_y_err, batch_w)
+            loss = svi.step(batch_x, batch_x_err, batch_y, batch_y_err,
+                            batch_w, batch_i)
             epoch_loss += loss
             batch_losses.append(loss)
 
