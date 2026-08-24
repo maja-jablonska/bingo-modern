@@ -225,7 +225,10 @@ def clean_labels(df, name, drop_saturated=False):
     report["dropped_nan"] = before - len(df)
 
     saturated = df["age"] > UNPHYSICAL_AGE_GYR
-    if drop_saturated:
+    if drop_saturated is None:
+        # Membership is the shared dataset's decision; leave these alone.
+        report["saturated_age_untouched"] = int(saturated.sum())
+    elif drop_saturated:
         # Ages older than the Universe are measurement failures, not old stars.
         report["dropped_unphysical_age"] = int(saturated.sum())
         df = df[~saturated]

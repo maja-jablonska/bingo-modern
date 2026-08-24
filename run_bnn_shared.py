@@ -38,7 +38,10 @@ import prepare_dataset as prep  # noqa: E402
 # Same catalogue labels the spectral methods train on: the BNN cannot see
 # pixels, but it must not be denied information Cannon/Lux have, or the
 # comparison measures the feature list rather than the method.
-FEATURES = prep.BASE_FEATURES + ["C_N", "M_H", "LOGG_SEISMIC", "AL_FE"]
+# Spectroscopic LOGG (in BASE_FEATURES), not LOGG_SEISMIC. The seismic value
+# is an INPUT here, so requiring it would confine the BNN to stars with
+# asteroseismology -- which excludes every large APOGEE sample.
+FEATURES = prep.BASE_FEATURES + ["C_N", "M_H", "AL_FE"]
 
 
 def main():
@@ -149,7 +152,10 @@ def main():
     frame = stardata.to_bingo_frame(
         stars, err_systematics=args.input_err_systematics == "on",
         err_inflation=args.err_inflation)
-    frame, report = prep.clean_labels(frame, "shared", drop_saturated=True)
+    # None: the shared dataset already decided membership, including whether
+    # ages above 13.8 Gyr are kept. Dropping or capping them again here would
+    # silently override that.
+    frame, report = prep.clean_labels(frame, "shared", drop_saturated=None)
     if report.get("n_dropped", 0):
         print(f"warning: clean_labels dropped rows on a shared dataset "
               f"(should be 0): {report}")
