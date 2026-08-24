@@ -65,6 +65,14 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--apply-to", default=None,
+                    help="parquet of ASPCAP parameters for stars OUTSIDE the "
+                         "labelled sample. Now that LOGG_SEISMIC is out of "
+                         "FEATURES the BNN needs no asteroseismology, so it "
+                         "can run wherever the catalogue parameters exist. "
+                         "Stars beyond the training parameter range are "
+                         "flagged in_training_range=False.")
+    ap.add_argument("--apply-out", default=None)
     ap.add_argument("--logg-seismic-from", default=None,
                     help="parquet of spectral predictions supplying "
                          "LOGG_SEISMIC in place of the seismic value. The "
@@ -303,9 +311,10 @@ def main():
             "residual": residual,
             "normalized_residual": residual / total_unc,
         })
-        return out, len(losses), intrinsic_mean, nu
+        return out, len(losses), intrinsic_mean, nu, model, guide, stats
 
-    summary, epochs_run, intrinsic_mean, nu = fit_predict(
+    (summary, epochs_run, intrinsic_mean, nu,
+     model_final, guide_final, stats) = fit_predict(
         parts["train"], parts["val"], parts["test"])
 
     if args.mode == "oof":
@@ -325,7 +334,7 @@ def main():
                 continue
             print(f"\nOOF fold {k}: train {len(tr)}, val {len(va)}, "
                   f"predict {len(pr)}")
-            o, _, _, _ = fit_predict(tr, va, pr)
+            o = fit_predict(tr, va, pr)[0]
             extra.append(o)
         if extra:
             summary = pd.concat([summary] + extra, ignore_index=True)
@@ -333,6 +342,51 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     summary.to_csv(outdir / "targeted_prediction_summary.csv", index=False)
+
+    if args.apply_to:
+        print(f"\napplying the trained model to {args.apply_to}")
+        import pyarrow.dataset as _ds
+        want = ["raw_teff","raw_e_teff","raw_logg","raw_e_logg","raw_fe_h",
+                "raw_e_fe_h","raw_mg_h","raw_e_mg_h","raw_c_h","raw_e_c_h",
+                "raw_n_h","raw_e_n_h","raw_al_h","raw_e_al_h","snr"]
+        dset = _ds.dataset(args.apply_to)
+        idc = next((c for c in ("APOGEE_ID","sdss4_apogee_id")
+                    if c in dset.schema.names), None)
+        cols = [idc] + [c for c in want if c in dset.schema.names]
+        ext = dset.to_table(columns=cols).to_pandas()
+        ext = stardata.derive_columns(ext.copy())
+        ext["APOGEE_ID"] = ext[idc].astype(str)
+        for c in ("is_primary", "split", "fold", "row_id"):
+            ext[c] = True if c == "is_primary" else 0
+        ext["age_L"] = np.nan; ext["log_age_L"] = np.nan
+        ext["e_log_age_L"] = 0.1
+        ef = stardata.to_bingo_frame(
+            ext, err_systematics=args.input_err_systematics == "on",
+            err_inflation=args.err_inflation)
+        ef = prep.derive_features(ef)
+        ok = np.all([np.isfinite(ef[f].to_numpy(float)) for f in FEATURES], axis=0)
+        print(f"  {len(ef)} stars, {int(ok.sum())} with all features finite")
+        efn = prep.apply_norm(ef[ok].reset_index(drop=True), FEATURES, stats)
+        Xa = t(efn[feat_cols].values); Xae = t(efn[err_cols].values)
+        yz = t(np.zeros(len(efn), np.float32))
+        sm, mp, mu_, it_ = get_targeted_posterior_samples(
+            model_final, guide_final, Xa, Xae, yz,
+            num_samples=100 if args.smoke else args.num_samples)
+        pm = np.median(sm, axis=0)
+        tot = np.sqrt(np.mean(mu_, axis=0)**2 + float(np.mean(it_))**2)
+        ao = pd.DataFrame({"star_id": efn["APOGEE_ID"].values,
+                           "pred_log_age": pm, "pred_sigma": tot})
+        ao["in_training_range"] = stardata.coverage_flag(
+            efn.rename(columns={"TEFF":"raw_teff","LOGG":"raw_logg",
+                                "FE_H":"raw_fe_h"}),
+            stars[stars["split"] == "train"],
+            labels=["raw_teff","raw_logg","raw_fe_h"])
+        apath = Path(args.apply_out or (outdir / "bnn_applied.parquet"))
+        ao.to_parquet(apath)
+        n_out = int((~ao.in_training_range).sum())
+        print(f"  wrote {len(ao)} predictions to {apath}")
+        print(f"  {n_out} ({100*n_out/max(len(ao),1):.1f}%) outside the "
+              f"training parameter range")
 
     import pyro
     pyro.get_param_store().save(str(outdir / "targeted_bnn_params.pth"))
