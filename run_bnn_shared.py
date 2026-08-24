@@ -62,6 +62,17 @@ def main():
     ap.add_argument("--num-samples", type=int, default=1000)
     ap.add_argument("--intrinsic-prior", type=float, nargs=2,
                     default=(0.1, 0.3))
+    ap.add_argument("--logg-seismic-from", default=None,
+                    help="parquet of spectral predictions supplying "
+                         "LOGG_SEISMIC in place of the seismic value. The "
+                         "BNN takes logg_seismic as an INPUT, so without "
+                         "numax it cannot run at all; Cannon and Lux instead "
+                         "PREDICT it from the spectrum. Substituting their "
+                         "prediction cascades the two and unlocks the BNN "
+                         "off the seismic sample -- at the cost of "
+                         "propagating the spectral model's error into the "
+                         "BNN's input. Point this at out-of-sample "
+                         "predictions or the test becomes circular.")
     ap.add_argument("--err-inflation", type=float, default=1.0,
                     help="scale the assumed input sigma_x. LatentNN's "
                          "correction strength is set by sigma_x, and "
@@ -147,6 +158,40 @@ def main():
     # clean_labels only guards prep.BASE_FEATURES, so the labels added here
     # to match the spectral methods would otherwise reach SVI unchecked
     needed = [c for f in FEATURES for c in (f, f"{f}_ERR")]
+    if args.logg_seismic_from:
+        src = pd.read_parquet(args.logg_seismic_from)
+        pc = next((c for c in ("pred_logg_seismic", "logg_seismic_pred")
+                   if c in src.columns), None)
+        ec = next((c for c in ("pred_err_logg_seismic", "logg_seismic_pred_err")
+                   if c in src.columns), None)
+        if pc is None:
+            sys.exit(f"{args.logg_seismic_from}: no predicted logg_seismic")
+        key = "row_id" if ("row_id" in src.columns
+                           and "row_id" in frame.columns) else "APOGEE_ID"
+        src = src.loc[:, [key, pc] + ([ec] if ec else [])]
+        if "is_primary" in pd.read_parquet(args.logg_seismic_from).columns:
+            ip = pd.read_parquet(args.logg_seismic_from, columns=[key, "is_primary"])
+            src = src.merge(ip, on=key).query("is_primary").drop(columns="is_primary")
+        src = src.drop_duplicates(key)
+        before = frame["LOGG_SEISMIC"].to_numpy(float).copy()
+        frame = frame.merge(src, on=key, how="left", suffixes=("", "_src"))
+        got = frame[pc].to_numpy(float)
+        n_bad = int((~np.isfinite(got)).sum())
+        if n_bad:
+            print(f"warning: {n_bad} stars had no predicted logg_seismic; "
+                  f"falling back to the seismic value for those")
+            got = np.where(np.isfinite(got), got, before)
+        frame["LOGG_SEISMIC"] = got
+        if ec:
+            e = frame[ec].to_numpy(float)
+            frame["LOGG_SEISMIC_ERR"] = np.where(np.isfinite(e) & (e > 0), e,
+                                                 frame["LOGG_SEISMIC_ERR"])
+        frame = frame.drop(columns=[c for c in (pc, ec) if c in frame.columns])
+        d = got - before
+        print(f"LOGG_SEISMIC substituted from {args.logg_seismic_from}: "
+              f"median offset {np.median(d[np.isfinite(d)]):+.4f}, "
+              f"scatter {1.4826*np.median(np.abs(d[np.isfinite(d)] - np.median(d[np.isfinite(d)]))):.4f} dex")
+
     missing = [c for c in needed
                if c not in frame.columns
                or not np.isfinite(frame[c].to_numpy(float)).all()]
@@ -298,7 +343,8 @@ def main():
                    ("hidden_dim", "initial_lr", "weight_clip",
                     "sample_weights", "input_err_systematics", "prior_scale",
                     "var_prior_scale", "likelihood", "student_t_df",
-                    "latent_inputs", "err_inflation", "early_stopping", "mode",
+                    "latent_inputs", "err_inflation", "logg_seismic_from",
+                    "early_stopping", "mode",
                     "batch_size", "iterations", "seed", "smoke")},
         "student_t_df_fitted": (float(nu) if args.likelihood == "student_t"
                                 and nu else None),
