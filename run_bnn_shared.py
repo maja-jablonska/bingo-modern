@@ -354,12 +354,15 @@ def main():
                     if c in dset.schema.names), None)
         cols = [idc] + [c for c in want if c in dset.schema.names]
         ext = dset.to_table(columns=cols).to_pandas()
-        ext = stardata.derive_columns(ext.copy())
         ext["APOGEE_ID"] = ext[idc].astype(str)
         for c in ("is_primary", "split", "fold", "row_id"):
             ext[c] = True if c == "is_primary" else 0
-        ext["age_L"] = np.nan; ext["log_age_L"] = np.nan
+        # placeholders BEFORE deriving: the sample has no ages (that is what
+        # is being predicted) and to_bingo_frame still expects the columns
+        ext["age_L"] = np.nan
+        ext["log_age_L"] = np.nan
         ext["e_log_age_L"] = 0.1
+        ext = stardata.derive_columns(ext.copy())
         ef = stardata.to_bingo_frame(
             ext, err_systematics=args.input_err_systematics == "on",
             err_inflation=args.err_inflation)
