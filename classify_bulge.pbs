@@ -12,7 +12,7 @@
 #PBS -l ncpus=4
 #PBS -l mem=16GB
 #PBS -l walltime=01:00:00
-#PBS -l storage=scratch/mk27
+#PBS -l storage=scratch/mk27+gdata/mk27+gdata/y89
 #PBS -l wd
 #PBS -N classify_bulge
 #PBS -j oe
